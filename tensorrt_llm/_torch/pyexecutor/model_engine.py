@@ -2279,7 +2279,8 @@ class PyTorchModelEngine(ModelEngine):
         return None
 
     def _set_spec_metadata_all_rank_num_tokens(
-            self, spec_metadata: SpecMetadata,
+            self,
+            spec_metadata: SpecMetadata,
             spec_all_rank_num_tokens: List[int],
             all_rank_num_seqs: List[int],
             all_rank_num_gens: Optional[List[int]] = None) -> None:
@@ -2657,10 +2658,10 @@ class PyTorchModelEngine(ModelEngine):
             # Handle distributed spec metadata
             if enable_attention_dp:
                 sequence_lengths = spec_metadata.seq_lens
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    [spec_metadata.num_tokens,
-                     len(sequence_lengths),
-                     attn_metadata.num_generations])
+                all_rank_num_tokens = self.dist.tp_cp_allgather([
+                    spec_metadata.num_tokens,
+                    len(sequence_lengths), attn_metadata.num_generations
+                ])
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[0] for item in all_rank_num_tokens],
                     [item[1] for item in all_rank_num_tokens],
@@ -4038,10 +4039,10 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    [spec_metadata.num_tokens,
-                     len(sequence_lengths),
-                     spec_metadata.num_generations])
+                all_rank_num_tokens = self.dist.tp_cp_allgather([
+                    spec_metadata.num_tokens,
+                    len(sequence_lengths), spec_metadata.num_generations
+                ])
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[0] for item in all_rank_num_tokens],
                     [item[1] for item in all_rank_num_tokens],

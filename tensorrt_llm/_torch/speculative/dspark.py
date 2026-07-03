@@ -532,11 +532,11 @@ class DSparkWorker(SpecWorkerBase):
         # rank agrees on the FUSED_COMM chunk count and per-rank slice.
         all_rank_draft_tokens = (
             [max(1, int(g) * block) for g in all_rank_num_gens]
-            if all_rank_num_gens is not None else None
+            if all_rank_num_gens is not None
+            else None
         )
         global_has_gen = (
-            max(all_rank_num_gens) > 0
-            if all_rank_num_gens is not None else num_gens > 0
+            max(all_rank_num_gens) > 0 if all_rank_num_gens is not None else num_gens > 0
         )
 
         if num_gens > 0:
@@ -562,9 +562,7 @@ class DSparkWorker(SpecWorkerBase):
             # still cross the draft MoE's cross-rank barrier the same number of
             # times (zero-token) so a FUSED_COMM phase-flip barrier stays lockstep.
             if global_has_gen:
-                draft_model.run_moe_lockstep_noop(
-                    all_rank_draft_tokens, accepted_tokens.device
-                )
+                draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, accepted_tokens.device)
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
 
         if num_contexts > 0:
