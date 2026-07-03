@@ -1048,7 +1048,13 @@ class DSparkDraftModel(nn.Module):
         for s, stage in enumerate(self.mtp_layers):
             stage_window = kv_windows[:, s] if kv_windows is not None else None
             h = self._forward_stage(
-                stage, h, main_x, start_pos, freqs_cis, moe_input_ids, stage_window,
+                stage,
+                h,
+                main_x,
+                start_pos,
+                freqs_cis,
+                moe_input_ids,
+                stage_window,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
 
@@ -1115,7 +1121,14 @@ class DSparkDraftModel(nn.Module):
         for s, stage in enumerate(self.mtp_layers):
             stage_window = kv_windows[:, s]  # [N, window_size, head_dim]
             h = self._forward_stage(
-                stage, h, main_x, start_pos, freqs_cis, moe_input_ids, stage_window, slots,
+                stage,
+                h,
+                main_x,
+                start_pos,
+                freqs_cis,
+                moe_input_ids,
+                stage_window,
+                slots,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
 
@@ -1156,7 +1169,7 @@ class DSparkDraftModel(nn.Module):
         # and still launches ``num_chunks`` cross-rank barrier crossings in
         # lockstep with the gen-bearing ranks.
         dummy_x = torch.zeros((1, hidden), dtype=torch.bfloat16, device=device)
-        dummy_ids = torch.zeros((1, ), dtype=torch.long, device=device)
+        dummy_ids = torch.zeros((1,), dtype=torch.long, device=device)
         for stage in self.mtp_layers:
             stage.mlp(
                 dummy_x,
