@@ -661,6 +661,38 @@ class PyExecutor:
         # The scheduler will avoid scheduling requests that are already in flight.
         self.inflight_req_ids = ReqIdsSet()
 
+        # Encoder-decoder models execute the encoder and decoder in separate
+        # iterations. The encoder branch lives in ``_executor_loop`` only;
+        # ``_executor_loop_overlap`` has not been threaded yet. Reject
+        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
+        # is intentionally out of scope for this port).
+        is_encoder_decoder = bool(
+            getattr(getattr(self.model_engine.model, "model_config", None),
+                    "is_encoder_decoder", False))
+        if is_encoder_decoder:
+            if self.dist.pp_size > 1:
+                raise NotImplementedError(
+                    "pp_size > 1 is not supported for encoder-decoder models "
+                    "in the PyTorch flow; encoder send/recv hooks are out of "
+                    "scope. Set pp_size=1 to run T5/BART/mBART.")
+            if not self.disable_overlap_scheduler:
+                raise NotImplementedError(
+                    "Overlap scheduler is not yet wired for encoder-decoder "
+                    "models. Set disable_overlap_scheduler=True for "
+                    "encoder-decoder runs.")
+            if getattr(self.model_engine, "_torch_compile_piecewise_cuda_graph",
+                       False):
+                raise NotImplementedError(
+                    "Piecewise CUDA graph is not supported for "
+                    "encoder-decoder models. Disable "
+                    "torch_compile_config.enable_piecewise_cuda_graph.")
+            if (getattr(self.model_engine, "cuda_graph_config", None)
+                    is not None and getattr(self.model_engine, "spec_config",
+                                            None) is not None):
+                raise NotImplementedError(
+                    "Speculative decoding with CUDA graph is not supported "
+                    "for encoder-decoder models.")
+
         # Synchronize all ranks before warmup. This prevents a PP
         # communication deadlock when ranks on the last PP stage are delayed
         # by heavy initialisation (e.g. guided-decoder / llguidance tokenizer
@@ -809,31 +841,6 @@ class PyExecutor:
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
                 self.dist, self._do_terminate_request)
-
-        # Encoder-decoder models execute the encoder and decoder in separate
-        # iterations. The encoder branch lives in ``_executor_loop`` only;
-        # ``_executor_loop_overlap`` has not been threaded yet. Reject
-        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
-        # is intentionally out of scope for this port).
-        is_encoder_decoder = bool(
-            getattr(getattr(self.model_engine.model, "model_config", None),
-                    "is_encoder_decoder", False))
-        if is_encoder_decoder:
-            if self.dist.pp_size > 1:
-                raise NotImplementedError(
-                    "pp_size > 1 is not supported for encoder-decoder models "
-                    "in the PyTorch flow; encoder send/recv hooks are out of "
-                    "scope. Set pp_size=1 to run T5/BART/mBART.")
-            if not self.disable_overlap_scheduler:
-                raise NotImplementedError(
-                    "Overlap scheduler is not yet wired for encoder-decoder "
-                    "models. Set disable_overlap_scheduler=True for "
-                    "encoder-decoder runs.")
-            if getattr(self.model_engine, "cuda_graph_config",
-                       None) is not None:
-                raise NotImplementedError(
-                    "CUDA graph is not supported for encoder-decoder models. "
-                    "Disable cuda_graph_config for encoder-decoder runs.")
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -2673,26 +2680,53 @@ class PyExecutor:
             from tensorrt_llm._torch.speculative.utils import \
                 get_draft_len_for_batch_size
 
+            spec_dec_mode = self.model_engine.spec_config.spec_dec_mode
+
             # 1. Resolve runtime draft length from schedule
             runtime_draft_len = get_draft_len_for_batch_size(
                 self.model_engine.spec_config.draft_len_schedule,
                 scheduled_batch.batch_size, self.model_engine.max_draft_len)
-
             # 2. Pad or truncate draft tokens to the resolved length
-            PADDING_TOKEN = 0
+            DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             for request in scheduled_batch.generation_requests:
-                current_draft_len = len(request.py_draft_tokens)
-                if current_draft_len < runtime_draft_len:
-                    padding_needed = runtime_draft_len - current_draft_len
-                    request.py_draft_tokens.extend([PADDING_TOKEN] *
-                                                   padding_needed)
-                elif current_draft_len > runtime_draft_len:
-                    request.py_draft_tokens = request.py_draft_tokens[:
-                                                                      runtime_draft_len]
+                current_num_draft_tokens = len(request.py_draft_tokens)
+                if spec_dec_mode.is_pard():
+                    # special case: PARD carries 2K-1 draft tokens per request
+                    runtime_draft_token_buffer_width = (
+                        self.model_engine.spec_config.
+                        get_runtime_tokens_per_gen_step(runtime_draft_len) - 1)
+                    current_runtime_draft_len = (
+                        current_num_draft_tokens +
+                        1) // 2 if current_num_draft_tokens > 0 else 0
+                    real_draft_tokens = request.py_draft_tokens[:min(
+                        current_runtime_draft_len, runtime_draft_len)]
+                    real_draft_tokens.extend(
+                        [DRAFT_BUFFER_PAD] *
+                        (runtime_draft_len - len(real_draft_tokens)))
+                    request.py_draft_tokens = real_draft_tokens + [
+                        DRAFT_BUFFER_PAD
+                    ] * (runtime_draft_token_buffer_width -
+                         len(real_draft_tokens))
+                else:
+                    if current_num_draft_tokens < runtime_draft_len:
+                        padding_needed = (runtime_draft_len -
+                                          current_num_draft_tokens)
+                        request.py_draft_tokens.extend([DRAFT_BUFFER_PAD] *
+                                                       padding_needed)
+                    elif current_num_draft_tokens > runtime_draft_len:
+                        request.py_draft_tokens = request.py_draft_tokens[:
+                                                                          runtime_draft_len]
 
             self.model_engine.runtime_draft_len = runtime_draft_len
         else:
-            self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
+            # Linear-tree modes (incl. PARD) use logical K; tree decoding
+            # (e.g. EAGLE3 dynamic tree) uses total tree tokens. Same
+            # selection as _prepare_tp_inputs and _get_graphs_to_capture.
+            spec_config = self.model_engine.spec_config
+            self.model_engine.runtime_draft_len = (
+                self.model_engine.max_draft_len
+                if spec_config is not None and spec_config.is_linear_tree else
+                self.model_engine.max_total_draft_tokens)
 
     def _can_queue(self, scheduled_batch):
 
