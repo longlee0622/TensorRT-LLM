@@ -531,6 +531,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.host_indexer_k_cache_block_offsets[: self.num_seqs],
             non_blocking=True,
         )
+        # Pad entries hold BAD_PAGE_INDEX (-1); clamp before _compute_slot_mappings
+        # dereferences them (mirrors base class).
+        self.indexer_k_cache_block_offsets.clamp_(min=0)
 
     def prepare_for_block_tables(self):
         """Prepare block tables for sliding-window and compressed attention."""

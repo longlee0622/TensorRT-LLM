@@ -972,14 +972,14 @@ class DSparkDraftModel(nn.Module):
                 **stage._dspark_attn,
                 **self._attn_params,
             )
-        h = stage.hc_attn.post_mapping(
-            x=attn, residual=residual, post_layer_mix=post_mix, comb_res_mix=comb_mix
+        residual, post_mix, comb_mix, layer_input = stage.hc_ffn.fused_hc(
+            x_prev=attn,
+            residual_prev=residual,
+            post_mix_prev=post_mix,
+            comb_mix_prev=comb_mix,
+            norm_weight=stage.post_attention_layernorm.weight,
+            norm_eps=stage.post_attention_layernorm.variance_epsilon,
         )
-
-        # --- MoE sub-block ---
-        residual = h
-        post_mix, comb_mix, layer_input = stage.hc_ffn.pre_mapping(residual)
-        layer_input = stage.post_attention_layernorm(layer_input)
         num_tokens = T * block
         # FUSED_COMM MoE backends (DeepGEMM MegaMoE) size their in-kernel
         # NVLink-barrier chunk loop from ``max(all_rank_num_tokens)`` and index

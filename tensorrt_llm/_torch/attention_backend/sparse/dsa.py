@@ -639,10 +639,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_quant_block_size = 128
         self.enable_indexer_skip = (sparse_metadata_params.enable_indexer_skip)
         capture_graph = self.is_cuda_graph
-        # Get compression ratio from sparse attention config. Plain DSA has no
-        # compression and uses the default [1]; DeepSeek-V4 overrides this.
-        self.compress_ratios = getattr(self.sparse_attention_config,
-                                       'compress_ratios', [1])
+        # Prefer sparse_metadata_params: sparse_attention_config isn't always
+        # threaded through by the model engine.
+        compress_ratios = getattr(sparse_metadata_params, "compress_ratios",
+                                  None)
+        if not compress_ratios:
+            compress_ratios = getattr(self.sparse_attention_config,
+                                      "compress_ratios", [1])
+        self.compress_ratios = compress_ratios
 
         # Effective tokens-per-block for the indexer k-cache slot mapping.
         # DeepSeek-V4's indexer cache uses layer-dependent compressed block sizes

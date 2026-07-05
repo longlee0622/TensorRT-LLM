@@ -236,10 +236,10 @@ def dspark_sparse_attn(
     valid = idx >= 0
     safe = idx.clamp(min=0)
 
-    # Gather KV per (batch, query): [b, m, topk, d]; zero the masked slots.
+    # Invalid slots read kv[0, :] (via safe.clamp), but masked_fill below
+    # zeros their softmax probs, so the einsum nullifies them.
     kv_exp = kv.unsqueeze(1).expand(b, m, kv.shape[1], d)
-    gathered = torch.gather(kv_exp, 2, safe.unsqueeze(-1).expand(b, m, safe.shape[-1], d))
-    gathered = (gathered * valid.unsqueeze(-1)).float()
+    gathered = torch.gather(kv_exp, 2, safe.unsqueeze(-1).expand(b, m, safe.shape[-1], d)).float()
 
     # Scores [b, m, h, topk]; mask invalid slots to -inf before the softmax.
     scores = torch.einsum("bmhd,bmkd->bmhk", q.float(), gathered) * softmax_scale
