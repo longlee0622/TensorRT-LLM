@@ -19,6 +19,7 @@
 # produces the whole block (and its confidence-truncated length) inside a single
 # ``DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
+import copy
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -91,6 +92,18 @@ class DSparkSpecMetadata(SpecMetadata):
             self.num_capture_layers = 0
             self._capture_layer_set = frozenset()
             self._layer_to_idx = {}
+
+    def create_cuda_graph_metadata(self, max_batch_size: int) -> "DSparkSpecMetadata":
+        """Create graph metadata sized for generation-only target tokens."""
+        if self.is_cuda_graph:
+            return self
+
+        cuda_graph_metadata = copy.copy(self)
+        cuda_graph_metadata.is_cuda_graph = True
+        cuda_graph_metadata.max_num_requests = max_batch_size
+        cuda_graph_metadata.max_num_tokens = max_batch_size * (self.max_draft_len + 1)
+        cuda_graph_metadata.__post_init__()
+        return cuda_graph_metadata
 
     def prepare(self):
         assert self.request_ids is not None
@@ -352,8 +365,8 @@ class DSparkWorker(SpecWorkerBase):
                 continue
 
             req_id = spec_metadata.request_ids[i]
-            first_position = int(chunk_positions[0].item())
-            slot = self._assign_slot(req_id, reset=first_position == 0)
+            num_cached_tokens = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[i]
+            slot = self._assign_slot(req_id, reset=num_cached_tokens == 0)
             self._ctx_len[slot] = chunk_positions[-1] + 1
 
             if captured is not None:

@@ -400,6 +400,9 @@ def _active_compressed_position_ids(
     }
     compressed_mask = {compress_ratio: torch.empty(total_slots, dtype=torch.bool, device=DEVICE)}
 
+    metadata.gen_output_offsets = {
+        compress_ratio: int(ctx_comp.item()),
+    }
     metadata.prepare_compressed_kv_metadata(kv_lens, cached_tokens)
     metadata._compute_compressed_mask(
         metadata.new_comp_kv_lens_cuda,

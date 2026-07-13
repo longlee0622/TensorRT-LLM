@@ -86,6 +86,19 @@ def test_metadata_no_capture_for_unlisted_layer():
     assert torch.count_nonzero(meta.get_hidden_states(4)) == 0
 
 
+def test_cuda_graph_metadata_right_sizes_capture_buffer():
+    meta = _make_metadata(max_num_requests=8, max_num_tokens=64)
+
+    graph_meta = meta.create_cuda_graph_metadata(max_batch_size=2)
+
+    assert graph_meta.is_cuda_graph
+    assert graph_meta.max_num_requests == 2
+    assert graph_meta.max_num_tokens == 2 * (meta.max_draft_len + 1)
+    assert graph_meta.captured_hidden_states.shape == (12, HIDDEN * NCAP)
+    assert graph_meta.captured_hidden_states.data_ptr() != meta.captured_hidden_states.data_ptr()
+    assert meta.captured_hidden_states.shape == (64, HIDDEN * NCAP)
+
+
 def test_metadata_prepare_batch_indices():
     meta = _make_metadata()
     meta.request_ids = [7, 3, 5]
@@ -201,7 +214,11 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
     worker._lazy_init(draft_model, metadata)
 
-    first_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[3])
+    first_chunk = types.SimpleNamespace(
+        num_contexts=1,
+        _seq_lens=[3],
+        kv_cache_params=types.SimpleNamespace(num_cached_tokens_per_seq=[0]),
+    )
     worker._seed_context_windows(
         draft_model, metadata, first_chunk, torch.tensor([[0, 1, 2]], device="cuda"), 3
     )
@@ -211,7 +228,11 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
         2, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
     )
-    second_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[2])
+    second_chunk = types.SimpleNamespace(
+        num_contexts=1,
+        _seq_lens=[2],
+        kv_cache_params=types.SimpleNamespace(num_cached_tokens_per_seq=[3]),
+    )
     worker._seed_context_windows(
         draft_model, metadata, second_chunk, torch.tensor([[3, 4]], device="cuda"), 2
     )

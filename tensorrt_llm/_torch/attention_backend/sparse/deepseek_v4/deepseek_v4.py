@@ -267,6 +267,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     num_total_compressed_tokens: Dict[int, int]
     # The max number of context compressed tokens for each compress ratio
     max_ctx_compressed_tokens: Dict[int, int]
+    # The generation output offset after context compression for each ratio
+    gen_output_offsets: Dict[int, int]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -276,6 +278,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
         self._ctx_output_sizes: Optional[Dict[int, int]] = None
+        self.gen_output_offsets = {}
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
             raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
@@ -750,6 +753,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 cu_new = new_comp_kv_lens.cumsum(0)
                 num_ctx_compressed_tokens = cu_new[num_contexts - 1].item()
                 ctx_output_sizes[compress_ratio] = num_ctx_compressed_tokens
+                self.gen_output_offsets[compress_ratio] = num_ctx_compressed_tokens
                 num_gen_compressed_tokens = num_generations * (
                     (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
                 )
@@ -766,6 +770,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 self.num_total_compressed_tokens[compress_ratio] = num_generations * (
                     (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
                 )
+                self.gen_output_offsets[compress_ratio] = 0
                 self.max_ctx_compressed_tokens[compress_ratio] = 0
 
         # Cached for on_update_kv_lens(); see the reuse gate there.
@@ -833,13 +838,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
 
         if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
-            # Extract output_offset as Python int per ratio to avoid
-            # tensor-scalar slice inside compiled function.
-            # For decode-only batches (num_contexts == 0), offset is 0.
-            gen_output_offsets = {
-                r: self.cu_new_comp_kv_cuda[r][num_contexts].item() if num_contexts > 0 else 0
-                for r in self._compress_ratios_sorted
-            }
             self._compute_gen_compressed_position_ids(
                 self.past_kv_lens_cuda,
                 self.cu_new_comp_kv_cuda,
@@ -848,7 +846,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_generations,
                 self.num_gen_tokens_per_seq,
                 self._compress_ratios_sorted,
-                gen_output_offsets,
+                self.gen_output_offsets,
             )
 
     def on_update_kv_lens(self):
