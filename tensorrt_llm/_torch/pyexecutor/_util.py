@@ -2535,9 +2535,37 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    # DSpark disagg (option 1a): compute the draft rolling-window shape so the
+    # Python (NIXL) transceiver can ship each request's projected window seed
+    # ctx -> gen alongside the KV cache. Duck-typed / None for non-DSpark models;
+    # create_kv_cache_transceiver only consumes it on the Python path (the C++
+    # transceiver ignores it and the feature degrades to today's zero-window
+    # behavior on the generation server).
+    dspark_window_shape = None
+    draft_model = getattr(model_engine.model, "draft_model", None)
+    if draft_model is not None:
+        from ..speculative.dspark import dspark_seed_window_shape
+        dspark_window_shape = dspark_seed_window_shape(draft_model)
+
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        mapping,
+        dist,
+        kv_cache_manager,
+        attention_type,
+        cache_transceiver_config,
+        mamba_cache_manager,
+        dspark_window_shape=dspark_window_shape)
+
+    # Enable ctx-side export of the seeded window only when the transceiver
+    # actually wired the seed path (Python transceiver). Harmless on the
+    # generation server (it never runs context seeding, so nothing is exported);
+    # a no-op for the C++ transceiver, avoiding an unbounded export dict when the
+    # seed is never shipped.
+    if getattr(kv_cache_transceiver, "_dspark_seed_enabled", False):
+        spec_worker = getattr(model_engine.model, "spec_worker", None)
+        if spec_worker is not None and hasattr(spec_worker,
+                                               "_export_seeds_enabled"):
+            spec_worker._export_seeds_enabled = True
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

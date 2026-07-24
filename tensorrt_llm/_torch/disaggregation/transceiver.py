@@ -63,10 +63,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        dspark_window_shape: Optional[tuple] = None,
     ):
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
+        # DSpark disagg (option 1a): when set, ship each request's projected draft
+        # rolling window (num_stages, window_size, head_dim) ctx -> gen via the aux
+        # buffer so the generation server reseeds instead of starting from zeros.
+        self._dspark_window_shape = dspark_window_shape
+        self._dspark_seed_enabled = dspark_window_shape is not None
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
         self._sender_future_timeout_ms = (
@@ -91,6 +97,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
                 # Size 0 turns bounce off; the block-count gate is internal (tuned via env).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                dspark_window_shape=dspark_window_shape,
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
@@ -314,8 +321,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return beam0_block_ids
         return np.concatenate([beam0_block_ids, tail_block_ids])
 
-    @staticmethod
-    def _need_aux_transfer(req: LlmRequest) -> bool:
+    def _need_aux_transfer(self, req: LlmRequest) -> bool:
+        # DSpark window-seed transfer (option 1a) needs the aux path for every
+        # request regardless of schedule style; otherwise only generation-first
+        # scheduling ships aux (first/draft tokens + counts).
+        if self._dspark_seed_enabled:
+            return True
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 

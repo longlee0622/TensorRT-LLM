@@ -2033,6 +2033,12 @@ class RxSession(RxSessionBase):
         )
         request.py_first_gen_tokens = first_gen_tokens  # type: ignore[attr-defined]
         request.py_draft_tokens = draft_tokens  # type: ignore[attr-defined]
+        # DSpark disagg (option 1a): surface the received rolling-window seed so
+        # py_executor can hand it to the spec worker before the first draft.
+        dspark_seed = self._aux_buffer.get_slot_dspark(self.aux_slot)
+        if dspark_seed is not None:
+            request.py_dspark_seed_window = dspark_seed[0]  # type: ignore[attr-defined]
+            request.py_dspark_seed_ctx_len = dspark_seed[1]  # type: ignore[attr-defined]
         if request.py_disaggregated_params is not None:
             request.py_disaggregated_params.ctx_usage = {
                 "prompt_tokens": prompt_tokens,
@@ -2218,7 +2224,10 @@ def _create_nixl_agent(name: str) -> NixlTransferAgent:
 
 
 def _make_aux_buffer(
-    kvm: KVCacheManager, max_slots: int, max_draft_len: Optional[int] = None
+    kvm: KVCacheManager,
+    max_slots: int,
+    max_draft_len: Optional[int] = None,
+    dspark_window_shape: Optional[tuple] = None,
 ) -> Optional[AuxBuffer]:
     if max_slots <= 0:
         return None
@@ -2229,6 +2238,7 @@ def _make_aux_buffer(
         beam_width=max(1, int(getattr(kvm, "max_beam_width", 1))),
         max_draft_len=max_draft_len,
         device="cpu",
+        dspark_window_shape=dspark_window_shape,
     )
 
 
@@ -2242,6 +2252,9 @@ class TransferWorkerConfig:
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
+    # DSpark disagg (option 1a): (num_stages, window_size, head_dim) of the draft
+    # rolling window to ship ctx -> gen; None disables window-seed transfer.
+    dspark_window_shape: Optional[tuple] = None
 
 
 class TransferWorker:
@@ -2249,7 +2262,10 @@ class TransferWorker:
         self._config = config
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
-            kvm, config.max_concurrent_sessions, config.max_draft_len
+            kvm,
+            config.max_concurrent_sessions,
+            config.max_draft_len,
+            config.dspark_window_shape,
         )
         self._rank_info = RankInfo.from_kv_cache_manager(
             config.instance_name,

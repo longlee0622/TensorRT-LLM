@@ -36,6 +36,23 @@ if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
 
 
+def dspark_seed_window_shape(draft_model) -> Optional[tuple]:
+    """Rolling-window shape ``(num_stages, window_size, head_dim)`` used by the
+    disaggregated window-seed transfer (option 1a).
+
+    Duck-typed on the draft model so callers can pass any one-engine draft model:
+    returns ``None`` for anything that is not a DSpark draft (no ``_attn_params`` /
+    ``num_stages``), i.e. the feature auto-disables for non-DSpark speculation.
+    """
+    attn = getattr(draft_model, "_attn_params", None)
+    num_stages = getattr(draft_model, "num_stages", None)
+    if not isinstance(attn, dict) or num_stages is None:
+        return None
+    if "window_size" not in attn or "head_dim" not in attn:
+        return None
+    return (int(num_stages), int(attn["window_size"]), int(attn["head_dim"]))
+
+
 @dataclass
 class DSparkSpecMetadata(SpecMetadata):
     """Metadata for DSpark speculative decoding.
@@ -113,6 +130,11 @@ class DSparkSpecMetadata(SpecMetadata):
                     worker._ctx_len[slot] = 0
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
+                    # Disagg (1a): drop any window seed left un-consumed for a
+                    # request that vanished (cancelled / errored before its KV was
+                    # sent, or a gen seed never applied) so the dicts stay bounded.
+                    worker._export_seeds.pop(rid, None)
+                    worker._pending_seeds.pop(rid, None)
             # Assign a persistent rolling-window slot to every real generation
             # request that never ran a context/seed forward on this worker. In
             # disaggregated serving the prompt is prefilled (and the window
@@ -130,7 +152,12 @@ class DSparkSpecMetadata(SpecMetadata):
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    worker._assign_slot(rid, reset=False)
+                    slot = worker._assign_slot(rid, reset=False)
+                    # Disagg (option 1a): if the context server shipped this
+                    # request's seeded rolling window, install it here (overriding
+                    # the zero-fill from _assign_slot) so the first draft attends to
+                    # real prompt context instead of an all-zero window.
+                    worker._apply_pending_seed(rid, slot)
             # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
             # requests, or disagg seed forwards without a real id) map to the
             # dedicated throwaway scratch row so they cannot overwrite a live
@@ -235,6 +262,23 @@ class DSparkWorker(SpecWorkerBase):
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
+
+        # Disaggregated-serving rolling-window seed transfer (option 1a). In disagg
+        # the prompt is prefilled -- and the window seeded via
+        # ``_seed_context_windows`` -- on the *context* server, but the draft runs on
+        # the *generation* server whose worker never sees a context forward, so its
+        # window would otherwise start all-zero (acceptance-rate loss for the first
+        # ``window_size`` steps until generated tokens refill it). To avoid that we
+        # ship the already-projected per-request window ([num_stages, win, head_dim])
+        # + its absolute decode position (``_ctx_len``) alongside the KV cache.
+        #   ctx side: ``_export_seeds[req_id] = (window_cpu, ctx_len)`` filled at seed
+        #   gen side: ``_pending_seeds[req_id] = (window, ctx_len)`` consumed in
+        #   ``prepare()`` when the request's slot is assigned (seed instead of zero).
+        # ``_export_seeds_enabled`` is set by py_executor only on a context server
+        # running DSpark disagg with the Python (NIXL) transceiver.
+        self._export_seeds_enabled = False
+        self._export_seeds: dict = {}  # ctx: request_id -> (window_cpu, ctx_len)
+        self._pending_seeds: dict = {}  # gen: request_id -> (window, ctx_len)
         # Index of the throwaway "scratch" window row that absorbs padded /
         # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
         # never handed out through ``_free_slots``.
@@ -308,6 +352,32 @@ class DSparkWorker(SpecWorkerBase):
             f"({max_batch} request slots + 1 scratch row)"
         )
 
+    def take_export_seed(self, req_id: int):
+        """ctx side: pop the seeded window + ctx_len for a finished context request.
+
+        Returns ``(window_cpu[num_stages, win, head_dim], ctx_len)`` or ``None``.
+        Called by py_executor right before the request's KV cache is shipped.
+        """
+        return self._export_seeds.pop(int(req_id), None)
+
+    def stash_pending_seed(self, req_id: int, window, ctx_len: int) -> None:
+        """gen side: record a received window seed to be applied when the request's
+        rolling-window slot is assigned in :meth:`DSparkSpecMetadata.prepare`."""
+        self._pending_seeds[int(req_id)] = (window, int(ctx_len))
+
+    def _apply_pending_seed(self, req_id: int, slot: int) -> bool:
+        """gen side: copy a pending window seed into ``slot`` (overriding the
+        zero-fill from ``_assign_slot``). Returns True if a seed was applied."""
+        seed = self._pending_seeds.pop(int(req_id), None)
+        if seed is None:
+            return False
+        window, ctx_len = seed
+        self._kv_windows[slot].copy_(
+            window.to(self._kv_windows.device, dtype=self._kv_windows.dtype, non_blocking=True)
+        )
+        self._ctx_len[slot] = ctx_len
+        return True
+
     def _assign_slot(self, req_id: int, reset: bool) -> int:
         """Get (or refresh) the slot for a request; reset clears its window."""
         if reset and req_id in self._req_to_slot:
@@ -363,6 +433,16 @@ class DSparkWorker(SpecWorkerBase):
                 # matching the generation path's start_pos convention.
                 window_positions = chunk_positions[-keep:] + 1
                 draft_model.write_context_windows(hidden, window_positions, self._kv_windows[slot])
+
+            # Disagg (option 1a): stash a CPU copy of the seeded window + absolute
+            # decode position so py_executor can ship it to the generation server
+            # alongside the KV cache. Overwritten per prefill chunk; the value left
+            # after the final chunk (read at KV-send time) is the complete seed.
+            if self._export_seeds_enabled:
+                self._export_seeds[int(req_id)] = (
+                    self._kv_windows[slot].detach().to("cpu").clone(),
+                    int(self._ctx_len[slot].item()),
+                )
             context_offset += chunk_len
 
     def _draft_gen_block_batched(

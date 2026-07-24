@@ -5885,6 +5885,19 @@ class PyExecutor:
                         0
                     ] * self.model_engine.max_total_draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+                # DSpark disagg (option 1a): hand the received rolling-window seed to
+                # the spec worker so this iteration's first draft attends to real
+                # prompt context instead of an all-zero window. Applied when the
+                # worker assigns the request's window slot in its next prepare().
+                seed_window = getattr(req, "py_dspark_seed_window", None)
+                if seed_window is not None:
+                    spec_worker = self.model_engine._get_spec_worker()
+                    if spec_worker is not None and hasattr(
+                            spec_worker, "stash_pending_seed"):
+                        spec_worker.stash_pending_seed(
+                            req.py_request_id, seed_window,
+                            req.py_dspark_seed_ctx_len)
+                    req.py_dspark_seed_window = None
                 beam_width = req.py_beam_width
                 if not self._update_sampler_state_for_disagg_gen_request(
                         req, beam_width, first_gen_tokens):
@@ -6077,6 +6090,17 @@ class PyExecutor:
                     if hasattr(self.kv_cache_manager, 'release_index_slot'):
                         self.kv_cache_manager.release_index_slot(
                             req.py_request_id)
+                    # DSpark disagg (option 1a): attach this request's seeded
+                    # rolling window so the transceiver aux-buffer path ships it to
+                    # the generation server (no-op unless a DSpark ctx worker stashed
+                    # one for py_request_id).
+                    spec_worker = self.model_engine._get_spec_worker()
+                    if spec_worker is not None and hasattr(
+                            spec_worker, "take_export_seed"):
+                        seed = spec_worker.take_export_seed(req.py_request_id)
+                        if seed is not None:
+                            (req.py_dspark_seed_window,
+                             req.py_dspark_seed_ctx_len) = seed
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
