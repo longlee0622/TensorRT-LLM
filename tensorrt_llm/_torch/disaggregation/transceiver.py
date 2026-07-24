@@ -321,14 +321,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return beam0_block_ids
         return np.concatenate([beam0_block_ids, tail_block_ids])
 
-    def _need_aux_transfer(self, req: LlmRequest) -> bool:
-        # DSpark window-seed transfer (option 1a) needs the aux path for every
-        # request regardless of schedule style; otherwise only generation-first
-        # scheduling ships aux (first/draft tokens + counts).
-        if self._dspark_seed_enabled:
-            return True
+    @staticmethod
+    def _is_generation_first(req: LlmRequest) -> bool:
+        # Generation-first scheduling ships the first/draft tokens + counts through
+        # the aux buffer; context-first scheduling delivers them on the HTTP disagg
+        # channel (into context_phase_params) instead.
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+
+    def _need_aux_transfer(self, req: LlmRequest) -> bool:
+        # DSpark window-seed transfer (option 1a) needs the aux path for every
+        # request regardless of schedule style (to piggyback the rolling window);
+        # otherwise only generation-first scheduling ships aux.
+        return self._dspark_seed_enabled or self._is_generation_first(req)
 
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
@@ -503,7 +508,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
+        # unpack_aux also surfaces py_dspark_seed_window/py_dspark_seed_ctx_len,
+        # which py_executor reads directly — so the DSpark seed is delivered for
+        # both schedule styles.
         session.unpack_aux(req)
+        # Context-first scheduling already received the real first/draft tokens on
+        # the HTTP disagg channel (context_phase_params). When DSpark seeding forced
+        # the aux path on for such a request, the aux buffer carried only the window
+        # seed (its token fields are empty); overwriting context_phase_params with
+        # those empties would drop the first token and crash the gen event loop.
+        # Only generation-first requests get their tokens from the aux buffer.
+        if not self._is_generation_first(req):
+            return
         first_gen_tokens = req.py_first_gen_tokens  # type: ignore[attr-defined]
         draft_tokens = req.py_draft_tokens
         if req.context_phase_params is None:
