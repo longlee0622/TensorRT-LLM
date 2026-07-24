@@ -1053,6 +1053,16 @@ class Sender(SenderBase):
         with session.lock:
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)
+            # DSpark disagg (option 1a): under context-first scheduling the sender
+            # computed and called send_aux() before this receiver registered, so the
+            # aux write had no destination and was a no-op. Now that the receiver's
+            # req_info is saved, (re)dispatch the aux task exactly as the KV tasks
+            # below. In generation-first the receiver registers first, this handler
+            # runs with session=None (aux is dispatched at send_aux() time instead),
+            # so this only fires for context-first. aux_task may still be None here
+            # if send_aux() has not run yet — send_aux() then dispatches it directly
+            # against the now-saved req_info, so no path is missed and none doubles.
+            aux_task = session.aux_task
             # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
             # Send it directly to unblock the receiver's TRANSFERRING task future;
             # CANCEL_SESSION alone would leave it stuck indefinitely.
@@ -1066,6 +1076,13 @@ class Sender(SenderBase):
             if task._perf_timer is not None:
                 task._perf_timer.record_push_start(trans_meta.peer_rank)
             self._enqueue(trans_meta)
+        if aux_task is not None:
+            if aux_task._perf_timer is not None:
+                aux_task._perf_timer.record_task_start(info.instance_rank)
+            aux_meta = self._build_aux_write_meta(aux_task, info)
+            if aux_task._perf_timer is not None:
+                aux_task._perf_timer.record_push_start(aux_meta.peer_rank)
+            self._enqueue(aux_meta)
 
     def _send_failed_result_to_receiver(self, info: RecvReqInfo):
         try:
@@ -1198,7 +1215,13 @@ class TxSession(TxSessionBase):
             SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
         )
         self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        # DSpark disagg (option 1a): a window-seed aux buffer ships per-request state
+        # for EVERY request, so the session must run the full aux handshake + wait
+        # even under context-first scheduling. The aux write is (re)dispatched on
+        # receiver registration in Sender._respond_with_kv, the same path KV uses.
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or getattr(
+            aux_buffer, "has_dspark_window", False
+        )
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
         self._aux_buffer = aux_buffer
@@ -1814,7 +1837,12 @@ class RxSession(RxSessionBase):
             SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
         )
         self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        # DSpark disagg (option 1a): see TxSession — a window-seed aux buffer forces
+        # the full aux handshake + completion wait so the receiver only reads the
+        # seed after the aux RDMA write has actually landed (never its zero init).
+        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST or getattr(
+            aux_buffer, "has_dspark_window", False
+        )
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
         self._aux_buffer = aux_buffer

@@ -229,6 +229,14 @@ class AuxBuffer(AuxBufferBase):
     def meta(self) -> AuxBufferMeta:
         return self._meta
 
+    @property
+    def has_dspark_window(self) -> bool:
+        """DSpark disagg (option 1a): True when this buffer carries a per-request
+        rolling-window seed sub-buffer. Every request then ships aux data
+        regardless of schedule style, so the session-level ``_need_aux`` gate must
+        run the full aux handshake + completion wait even under context-first."""
+        return self._dspark_window_buffer is not None
+
     def fill_slot(self, slot: int, request: LlmRequest) -> None:
         if slot not in self._occupied_slots:
             raise ValueError(
