@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from collections import deque, namedtuple
 from dataclasses import dataclass, field
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.logger import logger
 
 
 @dataclass
@@ -112,6 +114,27 @@ class AuxBuffer(AuxBufferBase):
         self._dspark_window_shape = (
             tuple(int(d) for d in dspark_window_shape) if dspark_window_shape is not None else None
         )
+
+        # The AuxBuffer pre-allocates every sub-buffer at max_slot_num, which is
+        # max_concurrent_sessions = max_batch_size * 20000 -- fine for the tiny
+        # token sub-buffers, but the DSpark window sub-buffer is
+        # prod(num_stages, window_size, head_dim) * 2 bytes (~0.5 MB) per slot, so
+        # the full count would need TBs of host RAM. Cap the slot count to a memory
+        # budget for the window buffer (still >> the realistic number of concurrent
+        # in-flight KV transfers). Only applies when the window seed is enabled.
+        if self._dspark_window_shape is not None:
+            win_bytes = 2  # bf16
+            for d in self._dspark_window_shape:
+                win_bytes *= int(d)
+            budget = int(os.environ.get("TRTLLM_DSPARK_SEED_BUDGET_BYTES", str(4 * 1024**3)))
+            cap = max(1, budget // max(1, win_bytes))
+            if cap < self._max_slot_num:
+                logger.warning(
+                    f"DSpark seed: capping AuxBuffer slots {self._max_slot_num} -> {cap} "
+                    f"to bound the window buffer to ~{budget / 1e9:.1f} GB "
+                    f"({win_bytes} bytes/slot)"
+                )
+                self._max_slot_num = cap
 
         self._free_slots = deque(list(range(self._max_slot_num)))
         self._occupied_slots: set[int] = set()
