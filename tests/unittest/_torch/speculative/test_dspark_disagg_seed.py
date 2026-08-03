@@ -40,6 +40,7 @@ def _bare_worker(
     # rows: max_batch request slots + 1 scratch row (mirrors _lazy_init)
     w._kv_windows = torch.zeros((max_batch + 1, num_stages, win, head_dim))
     w._ctx_len = torch.zeros(max_batch + 1, dtype=torch.long)
+    w._valid_len = torch.zeros(max_batch + 1, dtype=torch.long)
     w._batch_to_slot = torch.zeros(max_batch, dtype=torch.long)
     w._free_slots = deque(range(max_batch))
     w._req_to_slot = {}
@@ -59,21 +60,24 @@ def test_worker_seed_export_transfer_apply_roundtrip():
     ctx_slot = ctx._assign_slot(42, reset=True)
     ctx._kv_windows[ctx_slot].normal_()  # stand in for _seed_context_windows
     ctx._ctx_len[ctx_slot] = 137
+    ctx._valid_len[ctx_slot] = 5
     # what _seed_context_windows stashes when _export_seeds_enabled:
     ctx._export_seeds[42] = (
         ctx._kv_windows[ctx_slot].detach().to("cpu").clone(),
         int(ctx._ctx_len[ctx_slot].item()),
+        int(ctx._valid_len[ctx_slot].item()),
     )
 
     seed = ctx.take_export_seed(42)
     assert seed is not None
     assert ctx.take_export_seed(42) is None, "export must be pop-once"
-    exported_window, exported_ctx_len = seed
+    exported_window, exported_ctx_len, exported_valid_len = seed
     assert exported_ctx_len == 137
+    assert exported_valid_len == 5
 
     # --- generation server: fresh worker, stash pending, assign slot, apply ---
     gen = _bare_worker(max_batch, num_stages, win, head_dim, export_enabled=False)
-    gen.stash_pending_seed(42, exported_window, exported_ctx_len)
+    gen.stash_pending_seed(42, exported_window, exported_ctx_len, exported_valid_len)
 
     gen_slot = gen._assign_slot(42, reset=False)  # zeros window (as in prepare())
     assert torch.count_nonzero(gen._kv_windows[gen_slot]) == 0
@@ -85,6 +89,7 @@ def test_worker_seed_export_transfer_apply_roundtrip():
     # gen window is the ctx window (seeded, not zeroed); ctx_len propagated.
     assert torch.equal(gen._kv_windows[gen_slot], exported_window)
     assert int(gen._ctx_len[gen_slot].item()) == 137
+    assert int(gen._valid_len[gen_slot].item()) == 5
 
 
 def test_apply_pending_seed_noop_without_seed():
@@ -130,20 +135,22 @@ def test_auxbuffer_window_subbuffer_roundtrip():
         dspark_window_shape=(num_stages, win, head_dim),
     )
 
-    # meta now carries the 4 token sub-buffers + 2 DSpark sub-buffers.
-    assert len(buf.meta.ptrs) == 6
-    assert len(buf.meta.item_sizes) == 6
+    # meta carries the 4 token sub-buffers + 3 DSpark sub-buffers.
+    assert len(buf.meta.ptrs) == 7
+    assert len(buf.meta.item_sizes) == 7
 
     slot = buf.alloc_slot().id
-    # Simulate what fill_slot writes (window + ctx_len) without a full LlmRequest.
+    # Simulate what fill_slot writes without a full LlmRequest.
     window = torch.randn(num_stages, win, head_dim, dtype=torch.bfloat16)
     buf._dspark_window_buffer[slot].copy_(window)
     buf._dspark_ctx_len_buffer[slot, 0] = 137
+    buf._dspark_valid_len_buffer[slot, 0] = 5
 
     got = buf.get_slot_dspark(slot)
     assert got is not None
-    got_window, got_ctx_len = got
+    got_window, got_ctx_len, got_valid_len = got
     assert got_ctx_len == 137
+    assert got_valid_len == 5
     assert torch.equal(got_window, window)
 
     # ctx_len == -1 is the "no seed shipped" sentinel -> None.

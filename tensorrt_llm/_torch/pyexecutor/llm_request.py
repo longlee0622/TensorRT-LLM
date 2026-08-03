@@ -798,10 +798,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_disable_speculative_decoding = False
         # DSpark disaggregated rolling-window seed (option 1a): the context server
         # stashes its projected per-request window ([num_stages, win, head_dim]) and
-        # absolute decode position here so the KV-cache transceiver's aux-buffer path
-        # ships them to the generation server, which reseeds its draft window.
+        # absolute position plus valid count so the aux-buffer path can safely ship
+        # full or partial seeds to the generation server.
         self.py_dspark_seed_window = None
         self.py_dspark_seed_ctx_len = None
+        self.py_dspark_seed_valid_len = None
 
         # Chunked logits parameters
         self.py_use_chunked_generation_logits = use_chunked_generation_logits

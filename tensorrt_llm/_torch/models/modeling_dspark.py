@@ -698,6 +698,7 @@ class DSparkDraftModel(nn.Module):
         moe_input_ids: torch.Tensor,
         stage_window: Optional[torch.Tensor] = None,
         slots: Optional[torch.Tensor] = None,
+        valid_len: Optional[torch.Tensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """One DSpark stage = reference ``Block.forward`` with captured-context attn.
@@ -748,6 +749,7 @@ class DSparkDraftModel(nn.Module):
                 start_pos,
                 kv_cache,
                 slots,
+                valid_len=valid_len,
                 freqs_cis=freqs_cis,
                 persist=True,
                 **stage._dspark_attn,
@@ -889,6 +891,7 @@ class DSparkDraftModel(nn.Module):
         *,
         kv_windows: torch.Tensor,
         slots: torch.Tensor,
+        valid_len: Optional[torch.Tensor] = None,
         temperature: float = 0.0,
         confidence_threshold: float = 0.0,
         return_logits: bool = False,
@@ -913,6 +916,7 @@ class DSparkDraftModel(nn.Module):
             kv_windows: ``[N, num_stages, window_size, head_dim]`` persistent rolling
                 windows; written in place through ``slots``.
             slots: ``[G]`` int tensor mapping each request to its ``kv_windows`` row.
+            valid_len: ``[G]`` count of actually written rolling-window entries.
         Returns:
             ``(draft_tokens [G, block], num_proposed [G])`` from ``forward_head``.
         """
@@ -938,6 +942,7 @@ class DSparkDraftModel(nn.Module):
                 moe_input_ids,
                 stage_window,
                 slots,
+                valid_len,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
 

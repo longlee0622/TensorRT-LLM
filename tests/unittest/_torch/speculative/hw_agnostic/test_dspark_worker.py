@@ -120,6 +120,7 @@ def test_worker_lazy_init_window_buffers():
     # max_batch (8) request slots + 1 scratch row for padded / unknown IDs.
     assert worker._kv_windows.shape == (9, 3, 128, 64)
     assert worker._ctx_len.shape == (9,)
+    assert worker._valid_len.shape == (9,)
     assert worker._scratch_slot == 8
     # Dummy-id floor separates real request ids from CUDA-graph padding ids.
     assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
@@ -155,9 +156,11 @@ def test_worker_slot_assignment_and_reset():
 
     # mark a position, then reset -> slot freed + window/pos cleared
     worker._ctx_len[s0] = 42
+    worker._valid_len[s0] = 8
     worker._kv_windows[s0].fill_(1.0)
     s0b = worker._assign_slot(100, reset=True)
     assert int(worker._ctx_len[s0b]) == 0
+    assert int(worker._valid_len[s0b]) == 0
     assert float(worker._kv_windows[s0b].abs().sum()) == 0.0
 
 
@@ -193,7 +196,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     worker = _make_worker()
     draft_model = DraftModel()
     metadata = types.SimpleNamespace(
-        max_num_requests=1,
+        max_num_requests=2,
         request_ids=[100],
         get_hidden_states=lambda _num_tokens: torch.zeros(
             3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
@@ -207,6 +210,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
     slot = worker._req_to_slot[100]
     assert int(worker._ctx_len[slot]) == 3
+    assert int(worker._valid_len[slot]) == 3
 
     metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
         2, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
@@ -217,11 +221,26 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
 
     assert int(worker._ctx_len[slot]) == 5
+    assert int(worker._valid_len[slot]) == 5
     assert [positions.tolist() for positions in draft_model.written_positions] == [
         [1, 2, 3],
         [4, 5],
     ]
     assert torch.all(worker._kv_windows[slot] == 2.0)
+
+    # Prefix reuse starts at a non-zero absolute position, but only the
+    # actually computed suffix is valid for DSpark.
+    metadata.request_ids = [200]
+    metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
+        3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
+    )
+    prefix_reuse_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[3])
+    worker._seed_context_windows(
+        draft_model, metadata, prefix_reuse_chunk, torch.tensor([[100, 101, 102]], device="cuda"), 3
+    )
+    reused_slot = worker._req_to_slot[200]
+    assert int(worker._ctx_len[reused_slot]) == 103
+    assert int(worker._valid_len[reused_slot]) == 3
 
 
 def test_prepare_builds_batch_to_slot_on_batched_path():
@@ -251,6 +270,7 @@ def test_prepare_frees_stale_slots_on_batched_path():
     sa = worker._assign_slot(100, reset=True)
     worker._assign_slot(101, reset=True)
     worker._ctx_len[sa] = 17
+    worker._valid_len[sa] = 8
 
     # Only request 101 survives; 100's slot must be freed + cleared.
     meta.request_ids = [101]
@@ -258,6 +278,7 @@ def test_prepare_frees_stale_slots_on_batched_path():
     assert 100 not in worker._req_to_slot
     assert sa in worker._free_slots
     assert int(worker._ctx_len[sa]) == 0
+    assert int(worker._valid_len[sa]) == 0
 
 
 def test_prepare_maps_unknown_request_to_scratch_row_not_slot_zero():

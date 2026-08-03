@@ -107,10 +107,10 @@ class AuxBuffer(AuxBufferBase):
         self._max_draft_len = int(max_draft_len)
         self._device = device
         # DSpark disagg (option 1a): optional per-request rolling-window seed
-        # ([num_stages, window_size, head_dim] bf16) + its absolute decode position,
-        # shipped ctx -> gen alongside the KV cache so the generation server reseeds
-        # its draft window instead of starting from zeros. None when DSpark
-        # window-seed transfer is not enabled.
+        # ([num_stages, window_size, head_dim] bf16), absolute decode position, and
+        # actually-written entry count. These are shipped ctx -> gen alongside the
+        # target KV cache so the generation server can safely consume partial seeds.
+        # None when DSpark window-seed transfer is not enabled.
         self._dspark_window_shape = (
             tuple(int(d) for d in dspark_window_shape) if dspark_window_shape is not None else None
         )
@@ -172,6 +172,7 @@ class AuxBuffer(AuxBufferBase):
 
         self._dspark_window_buffer = None
         self._dspark_ctx_len_buffer = None
+        self._dspark_valid_len_buffer = None
         if self._dspark_window_shape is not None:
             self._dspark_window_buffer = torch.zeros(
                 self._max_slot_num,
@@ -182,8 +183,12 @@ class AuxBuffer(AuxBufferBase):
             self._dspark_ctx_len_buffer = torch.zeros(
                 self._max_slot_num, 1, dtype=torch.int64, device=self._device
             )
+            self._dspark_valid_len_buffer = torch.zeros(
+                self._max_slot_num, 1, dtype=torch.int64, device=self._device
+            )
             self._buffers.append(self._dspark_window_buffer)
             self._buffers.append(self._dspark_ctx_len_buffer)
+            self._buffers.append(self._dspark_valid_len_buffer)
 
         self._meta = AuxBufferMeta(
             ptrs=np.array([b.data_ptr() for b in self._buffers], dtype=np.int64),
@@ -274,7 +279,7 @@ class AuxBuffer(AuxBufferBase):
             torch.tensor([prompt_tokens, cached_tokens], dtype=torch.int32, device=self._device)
         )
 
-        # DSpark disagg (option 1a): copy the seeded rolling window + decode position.
+        # Copy the seeded rolling window, absolute position, and valid count.
         if self._dspark_window_buffer is not None:
             seed_window = getattr(request, "py_dspark_seed_window", None)
             if seed_window is not None:
@@ -284,11 +289,15 @@ class AuxBuffer(AuxBufferBase):
                 self._dspark_ctx_len_buffer[slot, 0] = int(
                     getattr(request, "py_dspark_seed_ctx_len", 0) or 0
                 )
+                self._dspark_valid_len_buffer[slot, 0] = int(
+                    getattr(request, "py_dspark_seed_valid_len", 0) or 0
+                )
             else:
                 # No seed for this request: zero the window and flag ctx_len < 0 so
                 # the receiver skips reseeding (leaves the gen worker's zero-fill).
                 self._dspark_window_buffer[slot].zero_()
                 self._dspark_ctx_len_buffer[slot, 0] = -1
+                self._dspark_valid_len_buffer[slot, 0] = 0
 
     @staticmethod
     def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int]:
@@ -323,12 +332,13 @@ class AuxBuffer(AuxBufferBase):
     def get_slot_dspark(self, slot: int):
         """DSpark disagg (option 1a): read the received rolling-window seed.
 
-        Returns ``(window[num_stages, win, head_dim], ctx_len)`` or ``None`` when
-        window-seed transfer is disabled or the context server shipped no seed.
+        Returns ``(window[num_stages, win, head_dim], ctx_len, valid_len)`` or
+        ``None`` when transfer is disabled or the context server shipped no seed.
         """
         if self._dspark_window_buffer is None:
             return None
         ctx_len = int(self._dspark_ctx_len_buffer[slot, 0].item())
         if ctx_len < 0:
             return None
-        return self._dspark_window_buffer[slot].clone(), ctx_len
+        valid_len = int(self._dspark_valid_len_buffer[slot, 0].item())
+        return self._dspark_window_buffer[slot].clone(), ctx_len, valid_len

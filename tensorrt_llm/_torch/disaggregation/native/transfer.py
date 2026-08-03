@@ -2067,6 +2067,7 @@ class RxSession(RxSessionBase):
         if dspark_seed is not None:
             request.py_dspark_seed_window = dspark_seed[0]  # type: ignore[attr-defined]
             request.py_dspark_seed_ctx_len = dspark_seed[1]  # type: ignore[attr-defined]
+            request.py_dspark_seed_valid_len = dspark_seed[2]  # type: ignore[attr-defined]
         if request.py_disaggregated_params is not None:
             request.py_disaggregated_params.ctx_usage = {
                 "prompt_tokens": prompt_tokens,

@@ -5896,7 +5896,8 @@ class PyExecutor:
                             spec_worker, "stash_pending_seed"):
                         spec_worker.stash_pending_seed(
                             req.py_request_id, seed_window,
-                            req.py_dspark_seed_ctx_len)
+                            req.py_dspark_seed_ctx_len,
+                            req.py_dspark_seed_valid_len)
                     req.py_dspark_seed_window = None
                 beam_width = req.py_beam_width
                 if not self._update_sampler_state_for_disagg_gen_request(
@@ -6100,7 +6101,8 @@ class PyExecutor:
                         seed = spec_worker.take_export_seed(req.py_request_id)
                         if seed is not None:
                             (req.py_dspark_seed_window,
-                             req.py_dspark_seed_ctx_len) = seed
+                             req.py_dspark_seed_ctx_len,
+                             req.py_dspark_seed_valid_len) = seed
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)

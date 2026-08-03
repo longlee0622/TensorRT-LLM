@@ -508,7 +508,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
-        # unpack_aux also surfaces py_dspark_seed_window/py_dspark_seed_ctx_len,
+        # unpack_aux also surfaces the DSpark seed window, absolute position, and
+        # valid count,
         # which py_executor reads directly — so the DSpark seed is delivered for
         # both schedule styles.
         session.unpack_aux(req)

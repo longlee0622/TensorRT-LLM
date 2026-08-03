@@ -128,6 +128,7 @@ class DSparkSpecMetadata(SpecMetadata):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
                     worker._ctx_len[slot] = 0
+                    worker._valid_len[slot] = 0
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
                     # Disagg (1a): drop any window seed left un-consumed for a
@@ -252,6 +253,7 @@ class DSparkWorker(SpecWorkerBase):
         self._win_inited = False
         self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
+        self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
         self._win = 0
 
         # Slot management. ``_req_to_slot`` (python dict) + ``_free_slots`` are the
@@ -270,15 +272,17 @@ class DSparkWorker(SpecWorkerBase):
         # window would otherwise start all-zero (acceptance-rate loss for the first
         # ``window_size`` steps until generated tokens refill it). To avoid that we
         # ship the already-projected per-request window ([num_stages, win, head_dim])
-        # + its absolute decode position (``_ctx_len``) alongside the KV cache.
-        #   ctx side: ``_export_seeds[req_id] = (window_cpu, ctx_len)`` filled at seed
-        #   gen side: ``_pending_seeds[req_id] = (window, ctx_len)`` consumed in
-        #   ``prepare()`` when the request's slot is assigned (seed instead of zero).
+        # + its absolute decode position (``_ctx_len``) and actually-written entry
+        # count (``_valid_len``) alongside the target KV cache. The latter prevents
+        # an absolute position beyond the window size from exposing unwritten slots
+        # when target-KV prefix reuse only computes a short prompt suffix.
+        #   ctx: ``_export_seeds[req_id] = (window_cpu, ctx_len, valid_len)``
+        #   gen: ``_pending_seeds[req_id] = (window, ctx_len, valid_len)``
         # ``_export_seeds_enabled`` is set by py_executor only on a context server
         # running DSpark disagg with the Python (NIXL) transceiver.
         self._export_seeds_enabled = False
-        self._export_seeds: dict = {}  # ctx: request_id -> (window_cpu, ctx_len)
-        self._pending_seeds: dict = {}  # gen: request_id -> (window, ctx_len)
+        self._export_seeds: dict = {}  # ctx: request_id -> (window_cpu, ctx_len, valid_len)
+        self._pending_seeds: dict = {}  # gen: request_id -> (window, ctx_len, valid_len)
         # Index of the throwaway "scratch" window row that absorbs padded /
         # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
         # never handed out through ``_free_slots``.
@@ -342,6 +346,7 @@ class DSparkWorker(SpecWorkerBase):
             device="cuda",
         )
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+        self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
@@ -353,17 +358,17 @@ class DSparkWorker(SpecWorkerBase):
         )
 
     def take_export_seed(self, req_id: int):
-        """ctx side: pop the seeded window + ctx_len for a finished context request.
+        """Pop the seeded window and lengths for a finished context request.
 
-        Returns ``(window_cpu[num_stages, win, head_dim], ctx_len)`` or ``None``.
-        Called by py_executor right before the request's KV cache is shipped.
+        Returns ``(window_cpu[num_stages, win, head_dim], ctx_len, valid_len)``
+        or ``None``. Called right before the request's target KV cache is shipped.
         """
         return self._export_seeds.pop(int(req_id), None)
 
-    def stash_pending_seed(self, req_id: int, window, ctx_len: int) -> None:
+    def stash_pending_seed(self, req_id: int, window, ctx_len: int, valid_len: int) -> None:
         """gen side: record a received window seed to be applied when the request's
         rolling-window slot is assigned in :meth:`DSparkSpecMetadata.prepare`."""
-        self._pending_seeds[int(req_id)] = (window, int(ctx_len))
+        self._pending_seeds[int(req_id)] = (window, int(ctx_len), int(valid_len))
 
     def _apply_pending_seed(self, req_id: int, slot: int) -> bool:
         """gen side: copy a pending window seed into ``slot`` (overriding the
@@ -371,11 +376,12 @@ class DSparkWorker(SpecWorkerBase):
         seed = self._pending_seeds.pop(int(req_id), None)
         if seed is None:
             return False
-        window, ctx_len = seed
+        window, ctx_len, valid_len = seed
         self._kv_windows[slot].copy_(
             window.to(self._kv_windows.device, dtype=self._kv_windows.dtype, non_blocking=True)
         )
         self._ctx_len[slot] = ctx_len
+        self._valid_len[slot] = min(self._win, max(0, valid_len))
         return True
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
@@ -383,6 +389,7 @@ class DSparkWorker(SpecWorkerBase):
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
             self._ctx_len[old] = 0
+            self._valid_len[old] = 0
             self._kv_windows[old].zero_()
             self._free_slots.append(old)
         if req_id not in self._req_to_slot:
@@ -394,6 +401,7 @@ class DSparkWorker(SpecWorkerBase):
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
             self._ctx_len[slot] = 0
+            self._valid_len[slot] = 0
             self._kv_windows[slot].zero_()
         return self._req_to_slot[req_id]
 
@@ -427,6 +435,9 @@ class DSparkWorker(SpecWorkerBase):
             self._ctx_len[slot] = chunk_positions[-1] + 1
 
             if captured is not None:
+                self._valid_len[slot] = torch.clamp(
+                    self._valid_len[slot] + chunk_len, max=self._win
+                )
                 keep = min(self._win, chunk_len)
                 hidden = captured[context_offset + chunk_len - keep : context_offset + chunk_len]
                 # A prompt token at absolute position p is stored in frame p+1,
@@ -434,14 +445,13 @@ class DSparkWorker(SpecWorkerBase):
                 window_positions = chunk_positions[-keep:] + 1
                 draft_model.write_context_windows(hidden, window_positions, self._kv_windows[slot])
 
-            # Disagg (option 1a): stash a CPU copy of the seeded window + absolute
-            # decode position so py_executor can ship it to the generation server
-            # alongside the KV cache. Overwritten per prefill chunk; the value left
-            # after the final chunk (read at KV-send time) is the complete seed.
+            # Stash a CPU copy of the seed, absolute position, and actual valid
+            # count. Overwritten per prefill chunk; the final value is shipped.
             if self._export_seeds_enabled:
                 self._export_seeds[int(req_id)] = (
                     self._kv_windows[slot].detach().to("cpu").clone(),
                     int(self._ctx_len[slot].item()),
+                    int(self._valid_len[slot].item()),
                 )
             context_offset += chunk_len
 
@@ -516,6 +526,7 @@ class DSparkWorker(SpecWorkerBase):
         # increment ctx_len) matches the eager path's frame value.
         start_pos = old + nacc  # [G]
         self._ctx_len[slots] = start_pos
+        self._valid_len[slots] = torch.clamp(self._valid_len[slots] + nacc, max=self._win)
 
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
         # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
@@ -526,6 +537,7 @@ class DSparkWorker(SpecWorkerBase):
             start_pos,
             kv_windows=self._kv_windows,
             slots=slots,
+            valid_len=self._valid_len[slots],
             temperature=0.0,
             confidence_threshold=0.0,
             return_logits=True,
@@ -572,7 +584,7 @@ class DSparkWorker(SpecWorkerBase):
         # the persistent rolling-window state. Snapshot and restore it so warmup is
         # side-effect-free. (During the capture pass itself the stream IS capturing,
         # so we skip the save/restore and let the ops be recorded; real requests
-        # reset their slot's window+ctx_len at prefill, wiping any capture-time
+        # reset their slot's window and lengths at prefill, wiping capture-time
         # mutation.)
         is_warmup = (
             getattr(spec_metadata, "is_cuda_graph", False)
@@ -580,6 +592,7 @@ class DSparkWorker(SpecWorkerBase):
         )
         if is_warmup:
             saved_ctx_len = self._ctx_len.clone()
+            saved_valid_len = self._valid_len.clone()
             saved_windows = self._kv_windows.clone()
 
         # Assign / reset window slots for context (prefill) requests and seed each
@@ -682,6 +695,7 @@ class DSparkWorker(SpecWorkerBase):
 
         if is_warmup:
             self._ctx_len.copy_(saved_ctx_len)
+            self._valid_len.copy_(saved_valid_len)
             self._kv_windows.copy_(saved_windows)
 
         return {
