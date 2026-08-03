@@ -116,7 +116,7 @@ target forward (context)
       builds _kv_windows[slot] (projected)         export norm≈353, ctx_len=prompt_len]
       + stashes CPU copy in _export_seeds[req_id]
 py_executor (KV-send path)
-  └ take_export_seed(req_id) -> req.py_dspark_seed_window / _ctx_len   [VERIFIED: seed set]
+  └ take_export_seed(req_id) -> window / ctx_len / valid_len           [VERIFIED: seed set]
   └ _finalize_send: _need_aux_transfer -> pack_aux
       └ AuxBuffer.fill_slot: copy seed into slot   [VERIFIED: TX branch=SEED, buf_norm≈353]
               ====== NIXL RDMA aux write (slot-indexed) ======>
@@ -125,7 +125,7 @@ py_executor (KV-send path)
                                                  _apply_aux -> unpack_aux -> get_slot_dspark
                                                    [OBSERVED: raw_ctx_len=0, buf_norm=0]
                                                  py_executor._prepare_disagg_gen_transmission_complete
-                                                   └ spec_worker.stash_pending_seed(req_id, window, ctx_len)
+                                                   └ stash_pending_seed(req_id, window, ctx_len, valid_len)
                                                      [VERIFIED: STASH rid matches ctx rid — keys OK]
                                                  DSparkSpecMetadata.prepare
                                                    └ _assign_slot(rid) + _apply_pending_seed

@@ -25,13 +25,13 @@ SPDX-License-Identifier: Apache-2.0
 - 在 disaggregated serving 中，由 prefill 端填满 prompt 尾部 window 并传给 decode，
   在语义上最接近 aggregated execution。prefill 不需要提前执行第一轮完整 drafter；
   decode 端拿到 seed 后再执行第一轮 draft 即可。
-- 当前 TRT-LLM `seed=on` 的主数据路径符合预期：prefill 生成 window 和逻辑长度，
-  传输端携带两者，decode 在分配 request slot 后、第一次 draft forward 前应用，
+- 当前 TRT-LLM `seed=on` 的主数据路径符合预期：prefill 生成 window、绝对位置和有效长度，
+  传输端携带三者，decode 在分配 request slot 后、第一次 draft forward 前应用，
   attention 随后会实际读取该 window。没有发现会使 seed 错位、应用过晚或完全不生效的
   明显实现错误。
 - aggregated/on/off 的 AL 接近是合理现象，不能单凭这一点判断 seed 没有生效。最重要的
   原因是：
-  1. seed-off 的空槽由 `ctx_len` mask 排除，并不会把 128 个零 KV 当作有效上下文；
+  1. seed-off 的空槽由 `valid_len=0` mask 排除，不会把 128 个零 KV 当作有效上下文；
   2. decode 每轮仍直接获得一个包含完整 prompt 信息的最新 target hidden；
   3. 每轮接受的中间 target tokens 都会回填 window，通常不是每轮只恢复一个槽；
   4. 128 window 主要补充高分辨率的短程上下文，可能不是该 checkpoint draft 质量的
@@ -190,7 +190,7 @@ Prefill node
       │
       ├─ main-model KV transfer ─────────────────────┐
       │                                              │
-      └─ build last-128 DSpark context KV + ctx_len ─┤
+      └─ build DSpark context KV + ctx_len + valid_len ─┤
                                                      ▼
 Decode node
   install target KV + DSpark seed
@@ -228,9 +228,9 @@ Context/prefill worker
 captured target hiddens
   -> _seed_context_windows()
   -> draft_model.write_context_windows()
-  -> per-slot window + ctx_len
+  -> per-slot window + ctx_len + valid_len
   -> take_export_seed()
-  -> BF16 auxiliary payload + int64 ctx_len
+  -> BF16 auxiliary payload + int64 ctx_len/valid_len
                         │
                         │ disaggregated transfer
                         ▼
@@ -251,9 +251,10 @@ stash_pending_seed()
 
 - 使用捕获到的 target hidden states；
 - 将 `ctx_len` 设置为最后一个 prompt position 加一；
+- 将 `valid_len` 设置为实际计算并写入的 entries 数（上限 128）；
 - 使用 token 的实际 absolute position 执行 context-window 写入；
 - 调用 `draft_model.write_context_windows()` 生成各层 KV；
-- 导出 window 和 `ctx_len`。
+- 导出 window、`ctx_len` 和 `valid_len`。
 
 `tensorrt_llm/_torch/models/modeling_dspark.py` 的
 `write_context_windows()` 完成：
@@ -273,6 +274,7 @@ auxiliary payload 包含：
 
 - BF16 rolling-window tensor；
 - int64 `ctx_len`。
+- int64 `valid_len`。
 
 以三层、128 window、head dimension 512 计算，每个 request 的 window payload 约为：
 
@@ -305,7 +307,7 @@ auxiliary payload 包含：
 - 当前 target hidden 先生成当前 position 的 `main_kv`；
 - `main_kv` 写入持久 window；
 - attention gather 当前 slot 的 circular rows；
-- 根据 `start_pos`/有效长度排除未填充 entries；
+- 根据 `start_pos` 和 `valid_len` 排除未填充 entries；
 - 将有效 context KV 和当前 draft-block KV 合并后计算 attention。
 
 所以 transfer 过来的 tensor 并非仅被保存但不使用；它位于 first-draft attention 的实际
@@ -319,8 +321,9 @@ auxiliary payload 包含：
 
 - 清零 window；
 - 设置 `_ctx_len = 0`。
+- 设置 `_valid_len = 0`。
 
-attention 构造 context top-k/mask 时，会用当前逻辑长度排除尚未填充的 slots。因此
+attention 构造 context top-k/mask 时，会用实际有效长度排除尚未填充的 slots。因此
 seed-off 并不是：
 
 ```text
@@ -344,7 +347,7 @@ seed-off 并不是：
 - 当前 round 的 target hidden 会写入；
 - 本轮中间已接受 token 对应的 captured target hiddens 也会通过
   `write_context_windows_batched()` 回填；
-- 逻辑长度按本轮已接受数量推进。
+- `ctx_len` 和 `valid_len` 按本轮已接受数量推进，后者封顶 128。
 
 因此恢复速度约与每轮实际接受 token 数量成正比。若 AL 接近 4，window 大约经过
 30 多轮即可包含 128 个新生成 positions，而不是必须经过 128 轮。
@@ -363,7 +366,7 @@ seed-off 并不是：
 
 - prefill 端错误地依赖 Markov/confidence head 才能构造 seed；
 - 传输了 draft-block 临时 KV，而不是 target-derived context KV；
-- 没有传输逻辑长度，导致空槽被当成有效槽；
+- 没有传输实际有效长度，导致 prefix-reuse partial seed 的空槽被当成有效槽；
 - 使用 prefill worker 的 slot id 直接寻址 decode worker；
 - seed 在第一轮 drafter 结束后才应用；
 - attention forward 完全绕过传入 seed；
@@ -601,9 +604,9 @@ window。
 从机制和代码路径看，TRT-LLM 当前 `seed=on` 实现与 DSpark reference 的核心语义一致：
 
 - prefill 端构造 target-derived per-layer context KV；
-- 连同逻辑长度传给 decode；
+- 连同绝对位置和实际有效长度传给 decode；
 - decode 在第一次 drafter forward 前安装；
-- attention 使用逻辑长度屏蔽无效槽，并读取有效 seed；
+- attention 使用 `valid_len` 屏蔽无效槽，并读取有效 seed；
 - 后续用 target-verified hidden states 持续维护同一 window。
 
 因此，现有 AL 无明显差别更可能说明 rolling seed 在当前 checkpoint、数据集和统计方法下
