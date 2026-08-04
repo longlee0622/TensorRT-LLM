@@ -1,0 +1,313 @@
+diff --git a/csrc/apis/mega.hpp b/csrc/apis/mega.hpp
+index b4ab0b3..ef09e1c 100644
+--- a/csrc/apis/mega.hpp
++++ b/csrc/apis/mega.hpp
+@@ -41,7 +41,7 @@ get_symm_buffer_size_for_mega_moe(
+     const std::string& mma_type, const std::string& activation,
+     const int& num_shared_experts = 0) {
+     DG_HOST_ASSERT(num_experts % num_ranks == 0);
+-    DG_HOST_ASSERT(activation == "swiglu");
++    DG_HOST_ASSERT(activation == "swiglu" or (mma_type == "fp8xfp4" and activation == "situ"));
+     DG_HOST_ASSERT(num_shared_experts >= 0);
+ 
+     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
+@@ -168,7 +168,9 @@ static void fp8_fp4_mega_moe(
+     const std::tuple<int, int, int>& recipe,
+     const std::string& activation,
+     const std::optional<float>& activation_clamp_opt,
+-    const bool& fast_math
++    const bool& fast_math,
++    const std::optional<float>& situ_beta_opt,
++    const std::optional<float>& situ_linear_beta_opt
+ ) {
+     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+@@ -177,13 +179,20 @@ static void fp8_fp4_mega_moe(
+     const auto num_tokens = static_cast<int>(y.size(0));
+     const auto [rm, rn, rk] = recipe;
+     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
+-    DG_HOST_ASSERT(activation == "swiglu");
++    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
+     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
+ 
+     // Activation checks
++    const auto use_situ = activation == "situ";
+     const auto activation_clamp =
+         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+     DG_HOST_ASSERT(activation_clamp >= 0);
++    const auto situ_beta = situ_beta_opt.value_or(0.0f);
++    const auto situ_linear_beta = situ_linear_beta_opt.value_or(0.0f);
++    DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value());
++    DG_HOST_ASSERT(not use_situ or (situ_beta > 0 and situ_linear_beta > 0));
++    DG_HOST_ASSERT(use_situ or
++                   (not situ_beta_opt.has_value() and not situ_linear_beta_opt.has_value()));
+ 
+     // Tensor checks
+     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
+@@ -274,7 +283,8 @@ static void fp8_fp4_mega_moe(
+                                num_shared_experts,
+                                num_tokens, num_topk,
+                                hidden, intermediate_hidden,
+-                               activation_clamp, fast_math);
++                               activation_clamp, fast_math,
++                               use_situ, situ_beta, situ_linear_beta);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+     }
+diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+index 9c4be4b..b323baa 100644
+--- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+@@ -25,6 +25,8 @@ public:
+         int num_ranks;
+         float activation_clamp;
+         bool fast_math;
++        bool use_situ;
++        float situ_beta, situ_linear_beta;
+         MegaMoEConfig config;
+ 
+         // Runtime arguments
+@@ -79,6 +81,9 @@ static void __instantiate_kernel() {{
+         {}, {}, {},
+         {}, {},
+         {},
++        {},
++        {},
++        {},
+         {}
+     >);
+ }};
+@@ -96,7 +101,9 @@ static void __instantiate_kernel() {{
+     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
+     args.launch_args.grid_dim.first, args.num_ranks,
+     to_string(args.activation_clamp),
+-    args.fast_math ? "true" : "false");
++    args.fast_math ? "true" : "false",
++    args.use_situ ? "true" : "false",
++    to_string(args.situ_beta), to_string(args.situ_linear_beta));
+     }
+ 
+     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+@@ -146,7 +153,10 @@ static void sm100_fp8_fp4_mega_moe(
+     const int& num_tokens, const int& num_topk,
+     const int& hidden, const int& intermediate_hidden,
+     const float& activation_clamp,
+-    const bool& fast_math
++    const bool& fast_math,
++    const bool& use_situ,
++    const float& situ_beta,
++    const float& situ_linear_beta
+ ) {
+     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+     const auto num_experts = num_experts_per_rank * num_ranks;
+@@ -283,6 +293,9 @@ static void sm100_fp8_fp4_mega_moe(
+         .num_ranks = num_ranks,
+         .activation_clamp = activation_clamp,
+         .fast_math = fast_math,
++        .use_situ = use_situ,
++        .situ_beta = situ_beta,
++        .situ_linear_beta = situ_linear_beta,
+         .config = config,
+         .y = y.data_ptr(),
+         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+index 4ac276d..e31eacd 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -35,6 +35,9 @@ template <
+     uint32_t kNumSMs, uint32_t kNumRanks,
+     float kActivationClamp,
+     bool kFastMath,
++    bool kUseSiTU,
++    float kSiTUBeta,
++    float kSiTULinearBeta,
+     bool kHasShared = (kNumSharedExperts > 0),
+     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
+     uint32_t L1_SHAPE_K = kHidden,
+@@ -84,6 +87,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
+     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
+     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
++    DG_STATIC_ASSERT(not kUseSiTU or (kSiTUBeta > 0 and kSiTULinearBeta > 0), "Invalid SiTU beta");
+ 
+     // Thread indices
+     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
+@@ -1042,7 +1046,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                         }
+ 
+-                        // Apply SwiGLU: silu(gate) * up
++                        // Apply SwiGLU or SiTU gated activation
+                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
+                         #pragma unroll
+                         for (uint32_t k = 0; k < 2; ++ k) {
+@@ -1056,18 +1060,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
+                             }
+ 
+-                            // SwiGLU
+-                            auto gate = __bfloat1622float2(bf16_gate);
++                            // SwiGLU or SiTU
++                            const auto raw_gate = __bfloat1622float2(bf16_gate);
+                             auto neg_gate_exp = make_float2(
+-                                kFastMath ? __expf(-gate.x) : expf(-gate.x),
+-                                kFastMath ? __expf(-gate.y) : expf(-gate.y));
++                                kFastMath ? __expf(-raw_gate.x) : expf(-raw_gate.x),
++                                kFastMath ? __expf(-raw_gate.y) : expf(-raw_gate.y));
+                             const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+-                            if constexpr (kFastMath) {
++                            auto gate = raw_gate;
++                            auto up = __bfloat1622float2(bf16_up);
++                            if constexpr (kUseSiTU) {
++                                constexpr float kInvSiTUBeta = 1.0f / kSiTUBeta;
++                                constexpr float kInvSiTULinearBeta = 1.0f / kSiTULinearBeta;
++                                float2 sigmoid;
++                                if constexpr (kFastMath) {
++                                    sigmoid = {math::fast_rcp(denom.x), math::fast_rcp(denom.y)};
++                                } else {
++                                    sigmoid = {1.0f / denom.x, 1.0f / denom.y};
++                                }
++                                const auto scaled_gate = __fmul2_rn(
++                                    raw_gate, {kInvSiTUBeta, kInvSiTUBeta});
++                                const auto scaled_up = __fmul2_rn(
++                                    up, {kInvSiTULinearBeta, kInvSiTULinearBeta});
++                                gate = __fmul2_rn(sigmoid, {
++                                    kSiTUBeta * tanhf(scaled_gate.x),
++                                    kSiTUBeta * tanhf(scaled_gate.y)});
++                                up = {
++                                    kSiTULinearBeta * tanhf(scaled_up.x),
++                                    kSiTULinearBeta * tanhf(scaled_up.y)};
++                            } else if constexpr (kFastMath) {
+                                 gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                             } else {
+                                 gate = {gate.x / denom.x, gate.y / denom.y};
+                             }
+-                            const auto up = __bfloat1622float2(bf16_up);
+                             activation_values[i][k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
+                         }
+ 
+diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
+index 2314564..f4233c0 100644
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -23,7 +23,8 @@ class SymmBuffer:
+                  num_shared_experts: int = 0,
+                  mma_type: str = 'fp8xfp4',
+                  activation: str = 'swiglu'):
+-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
++        assert activation == 'swiglu' or (mma_type == 'fp8xfp4' and activation == 'situ'), \
++            f'Only FP8xFP4 MegaMoE supports `situ`, got mma_type={mma_type!r}, activation={activation!r}'
+         self.group = group
+         self.num_experts = num_experts
+         self.num_max_tokens_per_rank = num_max_tokens_per_rank
+@@ -134,7 +135,9 @@ def transform_weights_for_mega_moe(
+     activation: str = 'swiglu'
+ ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
+-    assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
++    assert activation in ('swiglu', 'situ'), f'Unsupported activation: {activation!r}'
++    assert activation != 'situ' or (isinstance(l1_weights, tuple) and isinstance(l2_weights, tuple)), \
++        '`situ` requires FP8xFP4 `(weight, sf)` tuples for both L1 and L2 weights'
+     if isinstance(l1_weights, tuple):
+         # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
+         l1_w = _interleave_weights(l1_weights[0])
+@@ -160,7 +163,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+                      recipe: Tuple[int, int, int] = (1, 1, 32),
+                      activation: str = 'swiglu',
+                      activation_clamp: Optional[float] = None,
+-                     fast_math: bool = True):
++                     fast_math: bool = True,
++                     situ_beta: Optional[float] = None,
++                     situ_linear_beta: Optional[float] = None):
+     _C.fp8_fp4_mega_moe(
+         y,
+         l1_weights, l2_weights,
+@@ -172,7 +177,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+         sym_buffer.num_experts, sym_buffer.num_topk,
+         recipe,
+         activation, activation_clamp,
+-        fast_math
++        fast_math,
++        situ_beta, situ_linear_beta
+     )
+ 
+ def bf16_mega_moe(y: torch.Tensor,
+diff --git a/tests/test_mega_moe.py b/tests/test_mega_moe.py
+index 9987e02..9a6cf18 100644
+--- a/tests/test_mega_moe.py
++++ b/tests/test_mega_moe.py
+@@ -79,6 +79,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+ 
+     # Settings
+     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
++    assert not is_bf16xbf16 or args.activation == 'swiglu', 'SiTU is supported only for FP8xFP4 MegaMoE'
+     num_max_tokens_per_rank = args.num_max_tokens_per_rank
+     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
+         if args.num_tokens == 0 else args.num_tokens
+@@ -95,7 +96,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+         num_max_tokens_per_rank, num_topk,
+         hidden, intermediate_hidden,
+         num_shared_experts=num_shared_experts,
+-        mma_type=args.mma_type
++        mma_type=args.mma_type,
++        activation=args.activation
+     )
+ 
+     # Cast weights into FP4
+@@ -158,10 +160,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+                 shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
+ 
+         transformed_l1_weights, transformed_l2_weights = (
+-            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
++            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights, activation=args.activation))
+         if num_shared_experts > 0:
+             transformed_shared_l1_weights, transformed_shared_l2_weights = (
+-                deep_gemm.transform_weights_for_mega_moe(shared_l1_weights, shared_l2_weights))
++                deep_gemm.transform_weights_for_mega_moe(
++                    shared_l1_weights, shared_l2_weights, activation=args.activation))
+         else:
+             transformed_shared_l1_weights = transformed_shared_l2_weights = None
+ 
+@@ -187,8 +190,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
+             sym_buffer=buffer,
+             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+-            activation_clamp=args.activation_clamp,
++            activation=args.activation,
++            activation_clamp=args.activation_clamp if args.activation == 'swiglu' else None,
+             fast_math=bool(args.fast_math))
++        if not is_bf16xbf16:
++            kernel_kwargs.update(
++                situ_beta=args.situ_beta if args.activation == 'situ' else None,
++                situ_linear_beta=args.situ_linear_beta if args.activation == 'situ' else None)
+         if num_shared_experts > 0:
+             kernel_kwargs.update(
+                 shared_l1_weights=transformed_shared_l1_weights,
+@@ -205,6 +213,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+     dist_print(f' > Shared experts: {num_shared_experts}', once_in_node=True)
+     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
+     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
++    dist_print(f' > Activation: {args.activation}', once_in_node=True)
+     dist_print(once_in_node=True)
+ 
+     # Only do NCU profiling
+@@ -223,6 +232,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
+     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
++    # The legacy TileLang baseline only implements SwiGLU.
++    is_legacy_loaded = is_legacy_loaded and args.activation == 'swiglu'
+     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
+     ep_buffer = deep_ep.ElasticBuffer(
+@@ -424,6 +435,10 @@ if __name__ == '__main__':
+     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
+     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+ 
++    parser.add_argument('--activation', choices=('swiglu', 'situ'), default='swiglu', help='Gated activation')
++    parser.add_argument('--situ-beta', type=float, default=4.0, help='SiTU gate tanh beta')
++    parser.add_argument('--situ-linear-beta', type=float, default=25.0, help='SiTU linear tanh beta')
++
+     # Test settings
+     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
+     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
