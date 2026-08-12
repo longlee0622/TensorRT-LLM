@@ -121,10 +121,13 @@ class _ReopenSafeTensorSlice:
     def get_shape(self) -> list[int]:
         return list(self._shape)
 
+    def _tensor(self) -> torch.Tensor:
+        return self[()] if self.ndim == 0 else self[:]
+
     @classmethod
     def _materialize(cls, value: Any) -> Any:
         if isinstance(value, cls):
-            return value[:]
+            return value._tensor()
         if isinstance(value, dict):
             return {key: cls._materialize(item) for key, item in value.items()}
         if isinstance(value, list):
@@ -145,7 +148,7 @@ class _ReopenSafeTensorSlice:
         return func(*materialized_args, **materialized_kwargs)
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self[:], name)
+        return getattr(self._tensor(), name)
 
     def __getitem__(self, indices) -> torch.Tensor:
         with safetensors.safe_open(self._file_name,
@@ -165,7 +168,7 @@ class _ReopenSafeTensorSlice:
             return _ReopenSafeTensorSlice(self._file_name, self._name,
                                           list(self._shape),
                                           self._safetensors_dtype, dtype)
-        return self[:].view(dtype)
+        return self._tensor().view(dtype)
 
 
 @register_checkpoint_weight_loader("MX")

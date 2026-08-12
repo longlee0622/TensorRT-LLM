@@ -517,7 +517,11 @@ def test_deepseek_v4_lazy_safetensors_reopen_for_rank_local_slice(tmp_path, monk
         dtype=torch.int8,
     )
     tensor_name = "layers.0.ffn.experts.0.w1.weight"
-    safetensors.torch.save_file({tensor_name: source}, tmp_path / "model.safetensors")
+    scalar_name = "scalar"
+    safetensors.torch.save_file(
+        {tensor_name: source, scalar_name: torch.tensor(7)},
+        tmp_path / "model.safetensors",
+    )
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
 
     real_safe_open = safetensors.safe_open
@@ -549,8 +553,11 @@ def test_deepseek_v4_lazy_safetensors_reopen_for_rank_local_slice(tmp_path, monk
     assert not isinstance(remapped_weight, torch.Tensor)
     assert remapped_weight.dtype == torch.uint8
     assert open_count == close_count == 1
-    assert torch.equal(remapped_weight[1:3], source[1:3].view(torch.uint8))
+    assert weights[scalar_name].item() == 7
     assert open_count == close_count == 2
 
+    assert torch.equal(remapped_weight[1:3], source[1:3].view(torch.uint8))
+    assert open_count == close_count == 3
+
     assert torch.equal(torch.cat([lazy_weight, lazy_weight]), torch.cat([source, source]))
-    assert open_count == close_count == 4
+    assert open_count == close_count == 5
