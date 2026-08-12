@@ -460,7 +460,7 @@ class DSparkWorker(SpecWorkerBase):
         start_pos = old + nacc  # [G]
         self._ctx_len[slots] = start_pos
         self._valid_len[slots] = torch.clamp(self._valid_len[slots] + nacc, max=self._win)
-        self._position_initialized[slots] = True
+        self._position_initialized[slots] = torch.ones_like(slots, dtype=torch.bool)
 
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
         # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
