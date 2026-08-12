@@ -13,12 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import mmap
 import os
 import threading
+from contextlib import contextmanager
 from unittest import mock
 
 import pytest
+import safetensors
+import safetensors.torch
+import torch
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
@@ -228,8 +233,6 @@ def test_weight_cache_detects_inplace_mutation_and_reloads(tmp_path, monkeypatch
     # consumer mutating one in place (e.g. an in-place transform in a weight
     # mapper) must be detected on the next hit: the poisoned entry is dropped
     # and the weights are reloaded from disk instead of silently corrupted.
-    import torch
-
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
 
     checkpoint_dir = tmp_path / "foo"
@@ -491,3 +494,63 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     # Every chunk logs when the interval is zero: 3 files x 4 KB at a 1 KB
     # chunk size means at least 12 heartbeats (short reads only add more).
     assert len(progress_logs) >= 12
+
+
+@pytest.mark.parametrize(
+    "model_type, expected",
+    [
+        ("kimi_k3", True),
+        ("kimi_linear", True),
+        ("deepseek_v4", True),
+        ("deepseek_v3", False),
+    ],
+)
+def test_large_checkpoint_requires_lazy_safetensors(tmp_path, model_type, expected):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+    assert HfWeightLoader._requires_lazy_safetensors(str(tmp_path)) is expected
+
+
+def test_deepseek_v4_lazy_safetensors_reopen_for_rank_local_slice(tmp_path, monkeypatch):
+    source = torch.tensor(
+        [[-1, 2, -3, 4], [5, -6, 7, -8], [9, 10, -11, -12]],
+        dtype=torch.int8,
+    )
+    tensor_name = "layers.0.ffn.experts.0.w1.weight"
+    safetensors.torch.save_file({tensor_name: source}, tmp_path / "model.safetensors")
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
+
+    real_safe_open = safetensors.safe_open
+    open_count = 0
+    close_count = 0
+
+    @contextmanager
+    def tracked_safe_open(*args, **kwargs):
+        nonlocal open_count, close_count
+        open_count += 1
+        try:
+            with real_safe_open(*args, **kwargs) as handle:
+                yield handle
+        finally:
+            close_count += 1
+
+    monkeypatch.setattr(safetensors, "safe_open", tracked_safe_open)
+
+    weights = HfWeightLoader().load_weights(str(tmp_path), mapping=Mapping())
+    lazy_weight = weights[tensor_name]
+
+    assert not isinstance(lazy_weight, torch.Tensor)
+    assert lazy_weight.shape == source.shape
+    assert lazy_weight.dtype == torch.int8
+    assert open_count == close_count == 1
+
+    remapped_weight = lazy_weight.view(torch.uint8)
+
+    assert not isinstance(remapped_weight, torch.Tensor)
+    assert remapped_weight.dtype == torch.uint8
+    assert open_count == close_count == 1
+    assert torch.equal(remapped_weight[1:3], source[1:3].view(torch.uint8))
+    assert open_count == close_count == 2
+
+    assert torch.equal(torch.cat([lazy_weight, lazy_weight]), torch.cat([source, source]))
+    assert open_count == close_count == 4

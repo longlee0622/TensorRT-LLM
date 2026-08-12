@@ -59,6 +59,113 @@ _PREFETCH_LOG_INTERVAL_SEC = 60.0
 # the lock makes the check-and-set atomic across concurrent prefetch threads.
 _PREFETCH_FALLBACK_LOGGED = threading.Event()
 _PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
+_SAFETENSORS_TO_TORCH_DTYPE = {
+    "BOOL": "bool",
+    "U8": "uint8",
+    "I8": "int8",
+    "I16": "int16",
+    "U16": "uint16",
+    "I32": "int32",
+    "U32": "uint32",
+    "I64": "int64",
+    "U64": "uint64",
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E5M2": "float8_e5m2",
+    "F8_E8M0": "float8_e8m0fnu",
+    "F16": "float16",
+    "BF16": "bfloat16",
+    "F32": "float32",
+    "F64": "float64",
+}
+
+
+class _ReopenSafeTensorSlice:
+    """A safetensors slice that does not keep its file mmap alive."""
+
+    def __init__(self,
+                 file_name: str,
+                 name: str,
+                 shape: list[int],
+                 safetensors_dtype: str,
+                 view_dtype: torch.dtype | None = None) -> None:
+        self._file_name = file_name
+        self._name = name
+        self._shape = tuple(shape)
+        self._safetensors_dtype = safetensors_dtype
+        dtype_name = _SAFETENSORS_TO_TORCH_DTYPE.get(safetensors_dtype)
+        dtype = getattr(torch, dtype_name,
+                        None) if dtype_name is not None else None
+        if dtype is None:
+            raise RuntimeError(
+                f"Unsupported safetensors dtype {safetensors_dtype!r} for tensor {name!r}."
+            )
+        self._source_dtype = dtype
+        self._view_dtype = view_dtype
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cpu")
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._view_dtype or self._source_dtype
+
+    @property
+    def ndim(self) -> int:
+        return len(self._shape)
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size(self._shape)
+
+    def get_shape(self) -> list[int]:
+        return list(self._shape)
+
+    @classmethod
+    def _materialize(cls, value: Any) -> Any:
+        if isinstance(value, cls):
+            return value[:]
+        if isinstance(value, dict):
+            return {key: cls._materialize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._materialize(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._materialize(item) for item in value)
+        return value
+
+    @classmethod
+    def __torch_function__(cls,
+                           func: Any,
+                           types: tuple,
+                           args: tuple = (),
+                           kwargs: dict | None = None) -> Any:
+        del types
+        materialized_args = cls._materialize(args)
+        materialized_kwargs = cls._materialize(kwargs or {})
+        return func(*materialized_args, **materialized_kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self[:], name)
+
+    def __getitem__(self, indices) -> torch.Tensor:
+        with safetensors.safe_open(self._file_name,
+                                   framework="pt",
+                                   device="cpu") as handle:
+            tensor = handle.get_slice(self._name)[indices]
+        if self._view_dtype is not None:
+            tensor = tensor.view(self._view_dtype)
+        return tensor
+
+    def view(self,
+             dtype: torch.dtype) -> "_ReopenSafeTensorSlice | torch.Tensor":
+        if dtype == self.dtype:
+            return self
+        if torch.empty((), dtype=self.dtype).element_size() == torch.empty(
+            (), dtype=dtype).element_size():
+            return _ReopenSafeTensorSlice(self._file_name, self._name,
+                                          list(self._shape),
+                                          self._safetensors_dtype, dtype)
+        return self[:].view(dtype)
 
 
 @register_checkpoint_weight_loader("MX")
@@ -237,24 +344,19 @@ class HfWeightLoader(BaseWeightLoader):
             self._cache_loaded_weights(cache_key, weights)
         return weights
 
-    def cleanup(self) -> None:
-        # Drop lazy safetensors handles (if any) so the mmaps are released.
-        self._lazy_handles = []
-        super().cleanup()
-
     @staticmethod
-    def _is_kimi_k3_checkpoint(checkpoint_dir: str) -> bool:
-        """Kimi K3 checkpoints (~1.5 TB) must not be materialized in host RAM."""
+    def _requires_lazy_safetensors(checkpoint_dir: str) -> bool:
+        """Whether a checkpoint is too large to materialize in host RAM."""
         config_path = os.path.join(checkpoint_dir, "config.json")
         if not os.path.isfile(config_path):
             return False
         # Do not swallow read/parse failures: every rank must take the same
-        # branch here (the non-Kimi path enqueues collectives), so a
+        # branch here (the eager path enqueues collectives), so a
         # rank-local transient error routing one rank differently would
         # deadlock the job. Propagating fails fast on all ranks instead.
         with open(config_path) as f:
             model_type = json.load(f).get("model_type")
-        return model_type in ("kimi_k3", "kimi_linear")
+        return model_type in ("kimi_k3", "kimi_linear", "deepseek_v4")
 
     def _load_lazy_safetensors(
             self,
@@ -262,11 +364,11 @@ class HfWeightLoader(BaseWeightLoader):
             use_consolidated: bool = False) -> dict[str, Any]:
         """Return a dict of name -> lazy safetensors slices.
 
-        Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
-        indexing) materializes only the requested bytes from the mmapped
-        file. This lets a model's ``load_weights`` stream a huge checkpoint
-        and read only its rank-local shard (e.g. Kimi K3 expert-parallel
-        expert slices) without ever holding the full checkpoint in RAM.
+        Values reopen their safetensors file for each access, materialize only
+        the requested bytes, and close the file immediately. This lets a
+        model's ``load_weights`` read only its rank-local shard without ever
+        holding the full checkpoint in RAM or keeping every checkpoint mmap
+        alive at once.
         """
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
         if not weight_files:
@@ -280,19 +382,17 @@ class HfWeightLoader(BaseWeightLoader):
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
         weights: dict[str, Any] = {}
-        handles = []
         for file_name in weight_files:
-            handle = safetensors.safe_open(file_name,
-                                           framework="pt",
-                                           device="cpu")
-            handles.append(handle)
-            for name in handle.keys():
-                weights[name] = handle.get_slice(name)
-        # Keep the file handles alive for as long as the loader lives; the
-        # slices reference them. Released in cleanup().
-        self._lazy_handles = handles
-        logger.info(f"Lazily opened {len(weight_files)} safetensors files "
-                    f"({len(weights)} tensors) from {checkpoint_dir}")
+            with safetensors.safe_open(file_name, framework="pt",
+                                       device="cpu") as handle:
+                for name in handle.keys():
+                    tensor_slice = handle.get_slice(name)
+                    weights[name] = _ReopenSafeTensorSlice(
+                        file_name, name, tensor_slice.get_shape(),
+                        tensor_slice.get_dtype())
+        logger.info(
+            f"Indexed {len(weight_files)} safetensors files without "
+            f"persistent mmaps ({len(weights)} tensors) from {checkpoint_dir}")
         return ConsumableWeightsDict(weights)
 
     def load_weights(self,
@@ -300,7 +400,7 @@ class HfWeightLoader(BaseWeightLoader):
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
-        if self._is_kimi_k3_checkpoint(checkpoint_dir):
+        if self._requires_lazy_safetensors(checkpoint_dir):
             return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
