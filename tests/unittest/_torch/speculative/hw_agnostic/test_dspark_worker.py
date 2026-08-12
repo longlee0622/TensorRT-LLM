@@ -120,6 +120,7 @@ def test_worker_lazy_init_window_buffers():
     # max_batch (8) request slots + 1 scratch row for padded / unknown IDs.
     assert worker._kv_windows.shape == (9, 3, 128, 64)
     assert worker._ctx_len.shape == (9,)
+    assert worker._valid_len.shape == (9,)
     assert worker._position_initialized.shape == (9,)
     assert worker._scratch_slot == 8
     # Dummy-id floor separates real request ids from CUDA-graph padding ids.
@@ -156,10 +157,12 @@ def test_worker_slot_assignment_and_reset():
 
     # mark a position, then reset -> slot freed + window/pos cleared
     worker._ctx_len[s0] = 42
+    worker._valid_len[s0] = 8
     worker._position_initialized[s0] = True
     worker._kv_windows[s0].fill_(1.0)
     s0b = worker._assign_slot(100, reset=True)
     assert int(worker._ctx_len[s0b]) == 0
+    assert int(worker._valid_len[s0b]) == 0
     assert not bool(worker._position_initialized[s0b])
     assert float(worker._kv_windows[s0b].abs().sum()) == 0.0
 
@@ -210,6 +213,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
     slot = worker._req_to_slot[100]
     assert int(worker._ctx_len[slot]) == 3
+    assert int(worker._valid_len[slot]) == 3
     assert bool(worker._position_initialized[slot])
 
     metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
@@ -221,6 +225,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
 
     assert int(worker._ctx_len[slot]) == 5
+    assert int(worker._valid_len[slot]) == 5
     assert [positions.tolist() for positions in draft_model.written_positions] == [
         [1, 2, 3],
         [4, 5],
@@ -255,6 +260,7 @@ def test_prepare_frees_stale_slots_on_batched_path():
     sa = worker._assign_slot(100, reset=True)
     worker._assign_slot(101, reset=True)
     worker._ctx_len[sa] = 17
+    worker._valid_len[sa] = 8
 
     # Only request 101 survives; 100's slot must be freed + cleared.
     meta.request_ids = [101]
@@ -262,6 +268,7 @@ def test_prepare_frees_stale_slots_on_batched_path():
     assert 100 not in worker._req_to_slot
     assert sa in worker._free_slots
     assert int(worker._ctx_len[sa]) == 0
+    assert int(worker._valid_len[sa]) == 0
 
 
 def test_prepare_maps_unknown_request_to_scratch_row_not_slot_zero():
@@ -376,6 +383,7 @@ class _RecordingDraftModel:
                 "main_hidden": main_hidden.clone(),
                 "bonus": bonus.clone(),
                 "start_pos": start_pos.clone(),
+                "valid_len": kwargs["valid_len"].clone(),
             }
         )
         logits = torch.zeros(main_hidden.shape[0], self.block_size, 8, device=main_hidden.device)
@@ -421,6 +429,8 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     torch.testing.assert_close(first_call["main_hidden"], captured)
     assert first_call["start_pos"].tolist() == [4017, 88]
     assert worker._ctx_len[slots].tolist() == [4017, 88]
+    assert first_call["valid_len"].tolist() == [1, 1]
+    assert worker._valid_len[slots].tolist() == [1, 1]
     assert worker._position_initialized[slots].tolist() == [True, True]
 
     # Existing slots retain their state. The normal K+1 target layout must still
@@ -455,6 +465,8 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     torch.testing.assert_close(second_call["main_hidden"][0], captured[1])
     torch.testing.assert_close(second_call["main_hidden"][1], captured[target_width + 2])
     assert second_call["start_pos"].tolist() == [4019, 91]
+    assert second_call["valid_len"].tolist() == [3, 4]
+    assert worker._valid_len[slots].tolist() == [3, 4]
 
 
 def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):

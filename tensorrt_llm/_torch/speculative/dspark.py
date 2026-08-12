@@ -111,6 +111,7 @@ class DSparkSpecMetadata(SpecMetadata):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
                     worker._ctx_len[slot] = 0
+                    worker._valid_len[slot] = 0
                     worker._position_initialized[slot] = False
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
@@ -226,6 +227,7 @@ class DSparkWorker(SpecWorkerBase):
         self._win_inited = False
         self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
+        self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
         self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
         self._win = 0
 
@@ -300,6 +302,7 @@ class DSparkWorker(SpecWorkerBase):
             device="cuda",
         )
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+        self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._free_slots = deque(range(max_batch))
@@ -316,6 +319,7 @@ class DSparkWorker(SpecWorkerBase):
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
             self._ctx_len[old] = 0
+            self._valid_len[old] = 0
             self._position_initialized[old] = False
             self._kv_windows[old].zero_()
             self._free_slots.append(old)
@@ -328,6 +332,7 @@ class DSparkWorker(SpecWorkerBase):
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
             self._ctx_len[slot] = 0
+            self._valid_len[slot] = 0
             self._position_initialized[slot] = False
             self._kv_windows[slot].zero_()
         return self._req_to_slot[req_id]
@@ -363,6 +368,9 @@ class DSparkWorker(SpecWorkerBase):
             self._position_initialized[slot] = True
 
             if captured is not None:
+                self._valid_len[slot] = torch.clamp(
+                    self._valid_len[slot] + chunk_len, max=self._win
+                )
                 keep = min(self._win, chunk_len)
                 hidden = captured[context_offset + chunk_len - keep : context_offset + chunk_len]
                 # A prompt token at absolute position p is stored in frame p+1,
@@ -451,6 +459,7 @@ class DSparkWorker(SpecWorkerBase):
         # increment ctx_len) matches the eager path's frame value.
         start_pos = old + nacc  # [G]
         self._ctx_len[slots] = start_pos
+        self._valid_len[slots] = torch.clamp(self._valid_len[slots] + nacc, max=self._win)
         self._position_initialized[slots] = True
 
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
@@ -462,6 +471,7 @@ class DSparkWorker(SpecWorkerBase):
             start_pos,
             kv_windows=self._kv_windows,
             slots=slots,
+            valid_len=self._valid_len[slots],
             temperature=0.0,
             confidence_threshold=0.0,
             return_logits=True,
@@ -516,6 +526,7 @@ class DSparkWorker(SpecWorkerBase):
         )
         if is_warmup:
             saved_ctx_len = self._ctx_len.clone()
+            saved_valid_len = self._valid_len.clone()
             saved_position_initialized = self._position_initialized.clone()
             saved_windows = self._kv_windows.clone()
 
@@ -620,6 +631,7 @@ class DSparkWorker(SpecWorkerBase):
 
         if is_warmup:
             self._ctx_len.copy_(saved_ctx_len)
+            self._valid_len.copy_(saved_valid_len)
             self._position_initialized.copy_(saved_position_initialized)
             self._kv_windows.copy_(saved_windows)
 
