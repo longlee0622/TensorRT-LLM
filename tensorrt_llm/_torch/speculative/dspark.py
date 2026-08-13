@@ -511,16 +511,6 @@ class DSparkWorker(SpecWorkerBase):
             logits, attn_metadata, spec_metadata
         )
 
-        # DEBUG EXPERIMENT: keep DSpark drafting and CUDA-graph replay active, but
-        # commit only the first target-verified token for generation requests. If
-        # this restores target-only GSM8K parity, the corruption is downstream of
-        # multi-token acceptance (KV rewind/commit, packing, or state advance). If
-        # it does not, investigate the target forward/graph path before commit.
-        # Remove this unconditional clamp after the experiment. The existing
-        # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=0 setting is a no-op and cannot
-        # express this diagnostic.
-        num_accepted_tokens[num_contexts:batch_size].fill_(1)
-
         total_target_tokens = input_ids.shape[0]
 
         # CUDA-graph warmup guard: the warmup forwards (is_cuda_graph set, stream

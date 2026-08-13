@@ -500,12 +500,11 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
         num_tokens=batch_size,
     )
 
-    # Acceptance returns multi-token prefixes for generation requests; the debug
-    # clamp must reduce those rows to one while leaving context rows unchanged.
+    # Acceptance: return a fixed verified prefix (one accepted token per request).
     accepted = torch.arange(batch_size * (K + 1), dtype=torch.int32, device="cuda").reshape(
         batch_size, K + 1
     )
-    num_accepted = torch.tensor([1, 1, 2, 3, 4], dtype=torch.int32, device="cuda")
+    num_accepted = torch.ones(batch_size, dtype=torch.int32, device="cuda")
     accept_calls = {}
 
     def fake_accept(logits, am, sm):
@@ -568,4 +567,4 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     assert torch.equal(nd[num_contexts:], gen_logits.argmax(dim=-1).to(torch.int32))
     # Verified tokens are surfaced unchanged.
     assert torch.equal(out["new_tokens"], accepted)
-    assert out["new_tokens_lens"].tolist() == [1, 1, 1, 1, 1]
+    assert torch.equal(out["new_tokens_lens"], num_accepted)
