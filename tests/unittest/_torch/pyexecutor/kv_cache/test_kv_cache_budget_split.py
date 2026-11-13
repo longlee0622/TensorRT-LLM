@@ -502,6 +502,9 @@ class TestSplitGpuBudgetForDraft:
 
     def test_v1_mixed_draft_build_uses_original_max_seq_len(self, mocker):
         c = _make_creator(max_gpu_total_bytes=10 * GB)
+        # This test drives a mixed v1 build with MOCKED speculative config; the
+        # real drafter-dtype lookup must not see a Mock auto-attribute here.
+        c._model_engine.model.draft_model = None
         original_max_seq_len = 16384
         c._max_seq_len = original_max_seq_len
         c._skip_est = False

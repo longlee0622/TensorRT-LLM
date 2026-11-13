@@ -1824,6 +1824,10 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
 def _one_model_draft_creator(target_pool_ratio, mapping, draft_config) -> KvCacheCreator:
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = Mock(max_cuda_graph_batch_size=4)
+    # MOCK speculative configs leak into the drafter-dtype lookup as Mock
+    # auto-attributes; these tests exercise layout/estimation, not draft dtypes,
+    # so declare no drafter explicitly.
+    creator._model_engine.model.draft_model = None
     creator._kv_cache_config = KvCacheConfig(
         pool_ratio=target_pool_ratio,
         max_attention_window=None,
